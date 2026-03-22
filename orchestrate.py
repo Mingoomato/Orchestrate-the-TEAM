@@ -295,9 +295,8 @@ _IS_WINDOWS = _platform.system() == "Windows"
 MODEL_OPUS  = "gemini-2.5-pro"
 MODEL_HAIKU = "gemini-2.5-flash"  # 빠른 모델. 팀장/CEO 대화에는 불필요
 
-# ── 역할별 모델 티어 (TradingAgents 패턴: 깊은 추론 = Pro, 빠른 처리 = Flash) ──
+# ── 역할별 모델 티어 — 전체 gemini-2.5-pro ──
 MODEL_TIER = {
-    # Pro: 깊은 추론 필요
     "council":         MODEL_OPUS,
     "adversarial":     MODEL_OPUS,
     "member_sprint":   MODEL_OPUS,
@@ -305,11 +304,10 @@ MODEL_TIER = {
     "demis_synthesis": MODEL_OPUS,
     "demis_report":    MODEL_OPUS,
     "risk_debate":     MODEL_OPUS,
-    # Flash: 빠른 처리 (비용 절감)
-    "lead_assign":     MODEL_HAIKU,
-    "lead_review":     MODEL_HAIKU,
-    "sprint_summary":  MODEL_HAIKU,
-    "signal_extract":  MODEL_HAIKU,
+    "lead_assign":     MODEL_OPUS,
+    "lead_review":     MODEL_OPUS,
+    "sprint_summary":  MODEL_OPUS,
+    "signal_extract":  MODEL_OPUS,
 }
 
 DEMIS    = {"name": "Demis",    "codex": "CEO", "role": "Chief Executive Officer — 전략 합성 & 최종 보고", "model": MODEL_OPUS, "dept": "Executive"}
@@ -608,14 +606,12 @@ def call_claude(agent: dict, system_prompt: str, user_prompt: str,
 def call_codex(member: dict, prompt: str, timeout: int = 300) -> str:
     """
     (Replaced) Calls the Gemini API for code generation/implementation tasks.
-    Uses the faster MODEL_HAIKU for implementation.
     """
-    # Create a temporary agent dict for call_gemini, as 'member' might have a different structure
     agent_dict = {
         "name": member.get("name", "Codex"),
-        "model": MODEL_HAIKU, # Use the faster model for implementation tasks
+        "model": MODEL_OPUS,
     }
-    return call_gemini(agent_dict, prompt, MODEL_HAIKU, timeout)
+    return call_gemini(agent_dict, prompt, MODEL_OPUS, timeout)
 
 
 # ─────────────────────────────────────────────────────────────

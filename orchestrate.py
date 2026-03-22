@@ -559,15 +559,10 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
     _du(name, status="ACTIVE", msg="Generating with Gemini...")
 
     try:
-        # google-generativeai (구 SDK) 전용 Search Grounding 포맷
+        # glm.Tool(google_search=...) — gemini-2.5-pro 지원 포맷
         if allow_search:
-            try:
-                _tool = genai.protos.Tool(
-                    google_search_retrieval=genai.protos.GoogleSearchRetrieval()
-                )
-                tools = [_tool]
-            except AttributeError:
-                tools = None  # 구버전 SDK — 검색 없이 진행
+            import google.ai.generativelanguage as _glm
+            tools = [_glm.Tool(google_search=_glm.Tool.GoogleSearch())]
         else:
             tools = None
         model = genai.GenerativeModel(model_name, tools=tools)

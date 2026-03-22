@@ -559,7 +559,17 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
     _du(name, status="ACTIVE", msg="Generating with Gemini...")
 
     try:
-        tools = [{"google_search": {}}] if allow_search else None
+        # google-generativeai (구 SDK) 전용 Search Grounding 포맷
+        if allow_search:
+            try:
+                _tool = genai.protos.Tool(
+                    google_search_retrieval=genai.protos.GoogleSearchRetrieval()
+                )
+                tools = [_tool]
+            except AttributeError:
+                tools = None  # 구버전 SDK — 검색 없이 진행
+        else:
+            tools = None
         model = genai.GenerativeModel(model_name, tools=tools)
         # Gemini's 'timeout' in generate_content is a float in seconds
         response = model.generate_content(

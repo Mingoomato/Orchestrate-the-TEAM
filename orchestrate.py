@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Orchestration System v4 — Quantum Trading Council
+Orchestration System v5 — Quantum Trading Council (TradingAgents-Enhanced)
 
 에이전트 구성:
   Demis     (CEO, Opus)         — 회의 합성 → 팀장 태스크 배분 → 최종 보고서
@@ -80,8 +80,9 @@ except (KeyError, TypeError):
 CHECKPOINT_FILE = PROJECT_FOLDER / ".checkpoint.json"
 
 class Checkpoint:
-    PHASES = ["council", "synthesis", "plan_review",
-              "alpha_sprint", "beta_sprint", "cto_sprint", "final_report"]
+    PHASES = ["adversarial_debate", "council", "synthesis", "plan_review",
+              "alpha_sprint", "beta_sprint", "cto_sprint",
+              "risk_debate", "final_report"]
 
     def __init__(self, data: dict = None):
         self.data = data or {
@@ -95,6 +96,8 @@ class Checkpoint:
             "approved_map": {},
             "member_results": {},   # key: "Lead:Member" → result text
             "summaries": {"alpha": "", "beta": "", "cto": ""},
+            "adversarial_disputes": "",
+            "risk_verdict": "",
         }
 
     def save(self):
@@ -141,7 +144,85 @@ class Checkpoint:
             return None
 
 
-_CP: Checkpoint | None = None   # global checkpoint instance
+# ─────────────────────────────────────────────────────────────
+# Session Memory — TradingAgents 패턴: 세션 간 결정 학습
+# ─────────────────────────────────────────────────────────────
+MEMORY_FOLDER = PROJECT_FOLDER / "memory"
+MEMORY_FOLDER.mkdir(exist_ok=True)
+
+class SessionMemory:
+    """
+    세션 간 영속 메모리.
+    저장: (session_id, date, agenda_summary, key_decisions, sprint_outcomes)
+    검색: 현재 agenda와 키워드 overlap 기반 유사 세션 top-k 반환
+    → Grand Council 및 Demis synthesis에 주입
+    """
+    INDEX_FILE = MEMORY_FOLDER / "memory_index.json"
+
+    def store(self, session_id: str, agenda: str, decisions: list,
+              sprint_outcomes: dict, notes: str = "") -> None:
+        entry = {
+            "session_id": session_id,
+            "date": datetime.now().isoformat()[:10],
+            "agenda_summary": agenda[:300],
+            "keywords": self._extract_keywords(agenda),
+            "key_decisions": [str(d) for d in decisions[:10]],
+            "sprint_outcomes": {k: str(v)[:200] for k, v in sprint_outcomes.items()},
+            "notes": notes[:500],
+        }
+        index = self._load_index()
+        index[session_id] = entry
+        try:
+            self.INDEX_FILE.write_text(
+                json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[MEMORY] save failed: {e}", file=sys.stderr)
+
+    def retrieve_similar(self, current_agenda: str, top_k: int = 3) -> str:
+        """현재 agenda와 유사한 과거 세션 top-k → 프롬프트 주입용 문자열 반환"""
+        index = self._load_index()
+        if not index:
+            return ""
+        query_kw = set(self._extract_keywords(current_agenda))
+        scored = []
+        for sid, entry in index.items():
+            overlap = len(query_kw & set(entry.get("keywords", [])))
+            if overlap > 0:
+                scored.append((overlap, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            return ""
+        lines = ["=== RELEVANT PAST SESSIONS (for context — learn from these) ==="]
+        for score, entry in scored[:top_k]:
+            decisions_str = "; ".join(entry.get("key_decisions", [])[:3])
+            outcomes_str  = " | ".join(list(entry.get("sprint_outcomes", {}).values())[:2])
+            lines.append(
+                f"\n[{entry['date']}] {entry['agenda_summary'][:150]}\n"
+                f"  Decisions: {decisions_str}\n"
+                f"  Outcomes:  {outcomes_str[:200]}"
+            )
+        return "\n".join(lines)
+
+    def _extract_keywords(self, text: str) -> list:
+        important = {
+            "QLSTM","FR","OI","CVD","EMA200","Gate","WR","BEP","OOS","ATR",
+            "Structural","Feature","BTCUSDT","Koopman","Backtest","RL","MDD",
+            "Sharpe","Alpha","Beta","Signal","Model","Retraining","Sprint",
+            "SOLUSDT","ETHUSDT","Volatility","Regime","Liq","Cascade","Proxy",
+        }
+        words = re.findall(r'\b[A-Za-z][A-Za-z0-9_]{2,}\b', text)
+        return list({w for w in words if w in important or w[0].isupper()})[:30]
+
+    def _load_index(self) -> dict:
+        if not self.INDEX_FILE.exists():
+            return {}
+        try:
+            return json.loads(self.INDEX_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+_CP:  Checkpoint | None = None   # global checkpoint instance
+_MEM: SessionMemory = SessionMemory()  # global memory instance
 
 
 def _scan_last_session() -> dict:
@@ -213,6 +294,23 @@ _IS_WINDOWS = _platform.system() == "Windows"
 # ─────────────────────────────────────────────────────────────
 MODEL_OPUS  = "gemini-2.5-pro"
 MODEL_HAIKU = "gemini-2.5-flash"  # 빠른 모델. 팀장/CEO 대화에는 불필요
+
+# ── 역할별 모델 티어 (TradingAgents 패턴: 깊은 추론 = Pro, 빠른 처리 = Flash) ──
+MODEL_TIER = {
+    # Pro: 깊은 추론 필요
+    "council":         MODEL_OPUS,
+    "adversarial":     MODEL_OPUS,
+    "member_sprint":   MODEL_OPUS,
+    "viktor_solo":     MODEL_OPUS,
+    "demis_synthesis": MODEL_OPUS,
+    "demis_report":    MODEL_OPUS,
+    "risk_debate":     MODEL_OPUS,
+    # Flash: 빠른 처리 (비용 절감)
+    "lead_assign":     MODEL_HAIKU,
+    "lead_review":     MODEL_HAIKU,
+    "sprint_summary":  MODEL_HAIKU,
+    "signal_extract":  MODEL_HAIKU,
+}
 
 DEMIS    = {"name": "Demis",    "codex": "CEO", "role": "Chief Executive Officer — 전략 합성 & 최종 보고", "model": MODEL_OPUS, "dept": "Executive"}
 RADI     = {"name": "Radi",     "codex": "C1",  "role": "Team Alpha Lead — quant researcher & alpha signal design", "model": MODEL_OPUS, "dept": "Team Alpha"}
@@ -378,7 +476,7 @@ class Dashboard:
 
         # 하단 패널
         if self.council_mode:
-            SPKR = {"YOU":"bold yellow","Radi":"bold green","Casandra":"bold cyan","Viktor":"bold blue","Demis":"bold magenta"}
+            SPKR = {"YOU":"bold yellow","Radi":"bold green","Casandra":"bold cyan","Viktor":"bold blue","Demis":"bold magenta","Jose":"bold red","Council":"bold white"}
             lines = []
             for spk, msg in self.council_chat[-14:]:
                 clr   = SPKR.get(spk, "white")
@@ -493,14 +591,14 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
 
 def call_claude(agent: dict, system_prompt: str, user_prompt: str,
                 timeout: int = 120, allow_tools: bool = False,
-                session_id: str = None) -> str:
+                session_id: str = None, tier: str = None) -> str:
     """
     Prepares prompt and calls the Gemini API.
-    allow_tools=True enables Google Search grounding so the model can
-    search papers, arxiv, documentation, and internet resources.
+    tier: key into MODEL_TIER for role-based model selection (Pro vs Flash).
+    allow_tools=True enables Google Search grounding.
     session_id is ignored (Gemini stateless).
     """
-    model = agent["model"]
+    model = MODEL_TIER.get(tier, agent["model"]) if tier else agent["model"]
     payload = (f"{system_prompt}\n\n---\n\n{user_prompt}"
                if system_prompt else user_prompt)
 
@@ -714,7 +812,9 @@ def _build_code_digest(max_chars_per_file: int = 1800) -> str:
 
 
 # Built once at import time; injected into every council call
-_CODE_DIGEST: str = ""   # populated in run_grand_council()
+_CODE_DIGEST:    str = ""   # populated in run_grand_council()
+_ADV_CONTEXT:    str = ""   # pre-council adversarial debate summary
+_MEMORY_CONTEXT: str = ""   # similar past sessions from SessionMemory
 
 _PERSONAS = {
     "Viktor": (
@@ -751,18 +851,40 @@ _COUNCIL_RULES = (
 )
 
 
+# Risk debate personas (TradingAgents 3-perspective 패턴)
+_RISK_PERSONAS = {
+    "aggressive": (
+        "You are Radi (Aggressive Risk Advocate). "
+        "Argue for maximizing position size, leverage, and trade frequency given the sprint results. "
+        "Identify which sprint outcomes justify increasing risk exposure. "
+        "English only, plain text, 4 sentences max."
+    ),
+    "conservative": (
+        "You are Jose (Conservative Risk Manager). "
+        "Identify every risk that could cause drawdown exceeding MDD threshold. "
+        "Cite BEP, WR, fee model, kill switch triggers. "
+        "English only, plain text, 4 sentences max."
+    ),
+    "neutral": (
+        "You are Viktor (Neutral Mathematical Arbitrator). "
+        "Evaluate both positions using Kelly Criterion formula, EV calculation, and statistical significance. "
+        "Derive the mathematically optimal risk budget given sprint results. "
+        "Show your derivation. English only, plain text, 4 sentences max."
+    ),
+}
+
 def _council_call(lead: dict, system: str, user: str) -> str:
     """
     Fresh-session council call.
-    system + code digest merged into system_prompt;
-    call_claude handles stdin-pipe automatically when payload > 4000 chars.
+    system + code digest + adversarial context + memory merged into system_prompt.
     """
     code_section = (
         f"\n\nACTUAL CODEBASE (live -- reference exact names/structures below):\n"
         f"{_CODE_DIGEST}"
     ) if _CODE_DIGEST else ""
-    full_system = f"{system}{code_section}"
-    return call_claude(lead, full_system, user, timeout=300, session_id=None)
+    full_system = f"{system}{code_section}{_ADV_CONTEXT}{_MEMORY_CONTEXT}"
+    return call_claude(lead, full_system, user, timeout=300, session_id=None,
+                       tier="council")
 
 
 def _opening_statement(lead: dict, agenda: str, problem: str) -> str:
@@ -839,14 +961,107 @@ def _extract_decisions(history: list, existing: list) -> list:
     return new_decisions[-12:]
 
 
-def run_grand_council(agenda: str, problem: str) -> str:
+# ─────────────────────────────────────────────────────────────
+# Phase 0.5: Adversarial Pre-Council Debate (TradingAgents 패턴)
+# ─────────────────────────────────────────────────────────────
+def run_adversarial_debate(agenda: str, problem: str) -> dict:
+    """
+    Grand Council 전 사전 적대적 토론.
+    Radi (Bull: 알파 옹호) ↔ Viktor (Bear: 통계적 반박)
+    3라운드 × 2 exchanges = 6 API calls
+    → Council 및 Demis synthesis에 key_disputes 주입
+    """
+    _DASH and _DASH.update("", phase="Pre-Council · Adversarial Debate")
+    _dl("Pre-Council Adversarial Debate: Radi(Bull) ↔ Viktor(Bear) — 3 rounds")
+
+    bull_history: list = []
+    bear_history: list = []
+    ROUNDS = 3
+
+    bull_sys = (
+        f"{_PERSONAS['Radi']}\n\n{_PROJ_CTX}\n\n"
+        "ROLE IN THIS DEBATE: You are the BULL — argue why this specific system CAN generate "
+        "consistent positive alpha in live trading. Cite specific WR/EV numbers, mechanism "
+        "causality, and market microstructure evidence. "
+        "English only, plain text, 4 sentences max."
+    )
+    bear_sys = (
+        f"{_PERSONAS['Viktor']}\n\n{_PROJ_CTX}\n\n"
+        "ROLE IN THIS DEBATE: You are the BEAR — identify the single most critical "
+        "flaw, statistical risk, or implementation failure mode that will prevent this "
+        "system from generating alpha in live trading. Cite specific numbers, papers, "
+        "or derivations. English only, plain text, 4 sentences max."
+    )
+
+    for r in range(ROUNDS):
+        # Bull turn (Radi)
+        bear_last = bear_history[-1] if bear_history else ""
+        bull_user = (
+            f"Round {r+1}/{ROUNDS}. Agenda excerpt: {agenda[:300]}\n\n"
+            + (f"Bear's last argument:\n{bear_last[:250]}\n\n" if bear_last else "")
+            + "State your strongest bull argument for why this system will generate alpha. 4 sentences max."
+        )
+        _du("Radi", status="SPEAKING", task=f"Pre-debate R{r+1} Bull")
+        bull_resp = call_claude(RADI, bull_sys, bull_user,
+                                timeout=240, allow_tools=True, tier="adversarial")
+        bull_history.append(bull_resp)
+        _dc("Radi", f"[BULL R{r+1}] {bull_resp}")
+        _dl(f"[Pre-debate R{r+1}] Radi (Bull) done")
+
+        # Bear turn (Viktor)
+        bear_user = (
+            f"Round {r+1}/{ROUNDS}. Agenda excerpt: {agenda[:300]}\n\n"
+            f"Bull's argument:\n{bull_resp[:250]}\n\n"
+            "Counter with your strongest bear argument — specific flaw, number, or derivation. 4 sentences max."
+        )
+        _du("Viktor", status="SPEAKING", task=f"Pre-debate R{r+1} Bear")
+        bear_resp = call_claude(VIKTOR, bear_sys, bear_user,
+                                timeout=240, allow_tools=True, tier="adversarial")
+        bear_history.append(bear_resp)
+        _dc("Viktor", f"[BEAR R{r+1}] {bear_resp}")
+        _dl(f"[Pre-debate R{r+1}] Viktor (Bear) done")
+
+    # 핵심 쟁점 요약 (Flash — 빠른 처리)
+    summary_agent = {"name": "Demis", "model": MODEL_TIER["signal_extract"],
+                     "codex": "CEO", "role": "CEO", "dept": "Executive"}
+    summary_prompt = (
+        "Summarize the following bull/bear pre-council debate in 5 bullet points.\n"
+        "Focus ONLY on UNRESOLVED disputes and their technical core.\n"
+        "Format: DISPUTED: <bull claim> vs <bear counter>\n\n"
+        "BULL:\n" + "\n---\n".join(bull_history) +
+        "\n\nBEAR:\n" + "\n---\n".join(bear_history)
+    )
+    key_disputes = call_gemini(summary_agent, summary_prompt,
+                               MODEL_TIER["signal_extract"], 120)
+    _dl("Pre-council adversarial debate complete")
+
+    result = {
+        "bull_history": bull_history,
+        "bear_history": bear_history,
+        "key_disputes": key_disputes,
+    }
+    _save("pre_council_adversarial_debate", "Council", "PreCouncil",
+          "# Pre-Council Adversarial Debate\n\n"
+          "## Bull (Radi)\n" + "\n\n".join(bull_history) +
+          "\n\n## Bear (Viktor)\n" + "\n\n".join(bear_history) +
+          "\n\n## Key Disputes\n" + key_disputes)
+
+    if _CP:
+        _CP.mark("adversarial_debate", adversarial_disputes=key_disputes)
+    return result
+
+
+def run_grand_council(agenda: str, problem: str,
+                      adv_result: dict = None, memory_ctx: str = "") -> str:
     """
     Viktor-led structured council.
     Opening: Viktor → Radi → Casandra (position statements).
     Each round: 6 challenge+rebuttal pairs = 12 exchanges.
     MAX_ROUNDS=3 → total 3+36=39 API calls.
+    adv_result: output of run_adversarial_debate() — key_disputes injected into every call.
+    memory_ctx: similar past sessions from SessionMemory — injected into system prompts.
     """
-    global _CODE_DIGEST
+    global _CODE_DIGEST, _ADV_CONTEXT, _MEMORY_CONTEXT
     MAX_ROUNDS = 3
     SEP = "─" * 70
 
@@ -855,6 +1070,18 @@ def run_grand_council(agenda: str, problem: str) -> str:
     _CODE_DIGEST = _build_code_digest()
     digest_lines = _CODE_DIGEST.count("\n")
     _dl(f"Code digest ready: {len(_CODE_DIGEST)} chars, {digest_lines} lines from {len(_COUNCIL_FILES)} files")
+
+    # Adversarial debate context — injected into all council prompts
+    _ADV_CONTEXT = ""
+    if adv_result and adv_result.get("key_disputes"):
+        _ADV_CONTEXT = (
+            "\n\nPRE-COUNCIL ADVERSARIAL DEBATE — UNRESOLVED DISPUTES:\n"
+            f"{adv_result['key_disputes']}\n"
+            "These disputes are unresolved. Your council MUST address each one explicitly."
+        )
+
+    # Memory context — past similar sessions
+    _MEMORY_CONTEXT = f"\n\n{memory_ctx}" if memory_ctx else ""
 
     agenda_lines = [l.strip() for l in agenda.split("\n") if l.strip()]
     agenda_summary = " | ".join(agenda_lines[:4])[:300]
@@ -973,11 +1200,12 @@ def run_grand_council(agenda: str, problem: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # Phase 2: Demis — 합성 & 태스크 배분
 # ─────────────────────────────────────────────────────────────
-def demis_synthesize(transcript: str) -> tuple[str, dict]:
+def demis_synthesize(transcript: str, memory_ctx: str = "") -> tuple[str, dict]:
     _DASH and _DASH.update("", phase="Phase 2 · Demis Synthesis")
     _du("Demis", task="회의 합성 & 태스크 배분")
     _dl("Phase 2 — Demis synthesizing plan")
 
+    memory_section = f"\n\n{memory_ctx}" if memory_ctx else ""
     system = (
         "You are Demis (CEO) of a quantum crypto trading AI team.\n"
         "English only. Plain text, no markdown.\n"
@@ -994,9 +1222,10 @@ def demis_synthesize(transcript: str) -> tuple[str, dict]:
         "1. <concrete task>\n"
         "2. ...\n\n"
         "4-6 tasks per lead. Be specific. No filler."
+        + memory_section
     )
     user = f"TRANSCRIPT:\n{transcript}\n\nSynthesize and assign."
-    result = call_claude(DEMIS, system, user, timeout=180)
+    result = call_claude(DEMIS, system, user, timeout=180, tier="demis_synthesis")
     _save("demis_strategy_plan", "Demis", "Executive", result)
     _dl("Phase 2 complete")
     parsed = {
@@ -1068,7 +1297,8 @@ def _lead_assign_tasks(lead: dict, members: list[dict], plan: str, lead_tasks: l
         "Assign now. Output only [NAME]: task lines."
     )
     _du(lead["name"], task="팀원 태스크 할당 중")
-    kickoff = call_claude(lead, sys_p, usr_p, allow_tools=False, timeout=300)
+    kickoff = call_claude(lead, sys_p, usr_p, allow_tools=False, timeout=300,
+                          tier="lead_assign")
     _save(f"kickoff_{lead['dept'].replace(' ','_')}", lead["name"], lead["dept"], kickoff)
 
     # ── Parse [NAME]: task assignments ──
@@ -1096,14 +1326,21 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     sys_p = (
         f"You are {member['name']}, {member['role']}.\n"
         f"Working directory: {WORKSPACE}\n\n"
-        "You have access to tools: Read, Edit, Write, Bash, and Google Search.\n"
-        "You CAN and SHOULD search the internet for:\n"
-        "  - Latest research papers (arxiv, Google Scholar, Semantic Scholar)\n"
-        "  - Quant finance papers relevant to your task\n"
-        "  - Library documentation, API references\n"
-        "  - Implementation examples and benchmarks\n"
-        "Always cite sources when referencing papers or external findings.\n"
-        "Implement the assigned task, then report: files changed, key decisions, blockers, papers referenced."
+        "You have access to tools: Read, Edit, Write, Bash, and Google Search.\n\n"
+        "MANDATORY: Use the ReAct pattern for ALL actions:\n"
+        "  Thought: [Analyze — what do you know, what do you need?]\n"
+        "  Action:  [Tool call or code change — be specific with file paths]\n"
+        "  Observation: [Result of the action]\n"
+        "  ... (repeat Thought/Action/Observation until task is complete)\n"
+        "  Final Answer:\n"
+        "    Files changed: [list]\n"
+        "    Key decisions: [list]\n"
+        "    Blockers: [list or 'none']\n"
+        "    Papers cited: [Author (Year). Title. Venue. arxiv:ID]\n\n"
+        "When searching for papers:\n"
+        "  Thought: I need latest research on <topic> for this task\n"
+        "  Action: Google Search('arxiv <topic> quant finance 2024 2025')\n"
+        "  Observation: [search results]\n"
     )
     usr_p = (
         f"## Strategy Plan (summary)\n{plan[:600]}\n\n"
@@ -1119,7 +1356,8 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         "dept": member["dept"],
     }
     _du(member["name"], task=task[:50])
-    return call_claude(agent, sys_p, usr_p, allow_tools=True, timeout=600)
+    return call_claude(agent, sys_p, usr_p, allow_tools=True, timeout=600,
+                       tier="member_sprint")
 
 
 def _lead_review(lead: dict, member: dict, task: str,
@@ -1139,13 +1377,45 @@ def _lead_review(lead: dict, member: dict, task: str,
         f"IMPLEMENTATION RESULT:\n{impl_result[:2000]}\n\n"
         "Is this task complete? Respond APPROVED or REVISION: <feedback>"
     )
-    review = call_claude(lead, sys_p, usr_p, timeout=120)
+    review = call_claude(lead, sys_p, usr_p, timeout=120, tier="lead_review")
     if "TIMEOUT" in review or "ERROR" in review:
         return True, ""  # lead unavailable — treat as approved, move on
     if review.strip().upper().startswith("APPROVED"):
         return True, ""
     feedback = review[len("REVISION:"):].strip() if review.upper().startswith("REVISION:") else review
     return False, feedback
+
+
+def extract_sprint_decision(member_name: str, task: str, result: str) -> dict:
+    """
+    팀원 스프린트 결과에서 구조화된 결정 추출.
+    TradingAgents SignalProcessor 패턴 적용.
+    Returns dict with: action, confidence, files_changed, gate_impact, blockers, papers_cited
+    """
+    extract_agent = {"name": member_name, "model": MODEL_TIER["signal_extract"],
+                     "codex": "EX", "role": "extractor", "dept": "System"}
+    prompt = (
+        "Extract a structured decision from this sprint result. "
+        "Return ONLY a valid JSON object with exactly these keys:\n"
+        '{"action": "IMPLEMENTED|BLOCKED|PARTIAL|DEFERRED", '
+        '"confidence": 0-100, '
+        '"files_changed": ["file1", "file2"], '
+        '"gate_impact": "PASS|FAIL|PENDING|NA", '
+        '"blockers": ["blocker1"], '
+        '"papers_cited": ["Author (Year) Title"]}\n\n'
+        f"MEMBER: {member_name}\n"
+        f"TASK: {task[:200]}\n"
+        f"RESULT:\n{result[:1200]}"
+    )
+    raw = call_gemini(extract_agent, prompt, MODEL_TIER["signal_extract"], 60)
+    try:
+        m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception:
+        pass
+    return {"action": "UNKNOWN", "confidence": 0, "files_changed": [],
+            "gate_impact": "NA", "blockers": [], "papers_cited": []}
 
 
 def run_team_sprint(lead: dict, members: list[dict],
@@ -1157,7 +1427,8 @@ def run_team_sprint(lead: dict, members: list[dict],
     assignments, kickoff = _lead_assign_tasks(lead, members, plan, lead_tasks)
 
     # 각 팀원: 병렬 구현 → 팀장 검토 → (필요시 수정) 루프
-    final_results: dict[str, str] = {}
+    final_results:   dict[str, str]  = {}
+    final_decisions: dict[str, dict] = {}
     cp_lock = threading.Lock()
 
     def _run_member(member: dict) -> None:
@@ -1201,6 +1472,9 @@ def run_team_sprint(lead: dict, members: list[dict],
             if _CP and result and not any(x in result for x in ("[NO RESPONSE]", "TIMEOUT", "ERROR")):
                 _CP.set_member(lead["name"], member["name"], result)
             final_results[member["name"]] = result
+            # Extract structured decision (Flash — fast)
+            decision = extract_sprint_decision(member["name"], task, result)
+            final_decisions[member["name"]] = decision
 
     # Launch all members in parallel with stagger to avoid API rate limits
     threads = [threading.Thread(target=_run_member, args=(m,), daemon=True) for m in members]
@@ -1215,6 +1489,19 @@ def run_team_sprint(lead: dict, members: list[dict],
         f"[{m['name']}]\n{final_results.get(m['name'],'[NO RESULT]')}"
         for m in members
     )
+    # Structured decision table
+    decision_table = (
+        "| Member | Action | Confidence | Gate | Files Changed |\n"
+        "|--------|--------|-----------|------|---------------|\n"
+    )
+    for m in members:
+        d = final_decisions.get(m["name"], {})
+        files_str = ", ".join(d.get("files_changed", [])[:2]) or "-"
+        decision_table += (
+            f"| {m['name']} | {d.get('action','?')} | {d.get('confidence','?')}% | "
+            f"{d.get('gate_impact','?')} | {files_str} |\n"
+        )
+
     sum_sys = (
         f"You are {lead['name']}, team lead of {lead['dept']}.\n"
         "Compile a Sprint Completion Report (200 words):\n"
@@ -1225,11 +1512,14 @@ def run_team_sprint(lead: dict, members: list[dict],
     )
     sum_usr = f"SPRINT LOG:\n{sprint_log[:4000]}\n\nWrite the Sprint Completion Report."
     _du(lead["name"], task="스프린트 결과 취합 보고서 작성")
-    summary = call_claude(lead, sum_sys, sum_usr, allow_tools=False)
+    summary = call_claude(lead, sum_sys, sum_usr, allow_tools=False,
+                          tier="sprint_summary")
 
     _save(f"sprint_completion_{lead['dept'].replace(' ','_')}", lead["name"], lead["dept"],
           f"# {lead['dept']} Sprint Report\n**Date:** {datetime.now()}\n\n"
-          f"## Summary\n{summary}\n\n## Full Log\n\n{sprint_log}")
+          f"## Summary\n{summary}\n\n"
+          f"## Structured Decisions\n{decision_table}\n\n"
+          f"## Full Log\n\n{sprint_log}")
     _dl(f"{lead['dept']} sprint complete")
     # Save sprint summary to checkpoint
     if _CP:
@@ -1363,23 +1653,30 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
     tasks_str = "\n".join(f"{i+1}. {t}" for i, t in enumerate(viktor_tasks)) if viktor_tasks else "See plan."
     sys_p = (
         "You are Viktor, Quant Researcher CTO.\n"
-        "You have access to Google Search — use it to find and cite the latest academic papers,\n"
-        "arxiv preprints, and quant finance research relevant to your validation tasks.\n"
-        "Produce a rigorous CTO Validation Report. Structure:\n"
-        "1. OOS Gate Criteria (Gate 1 + Gate 2 exact thresholds)\n"
+        "You have access to Google Search — use it actively.\n\n"
+        "Use the ReAct pattern:\n"
+        "  Thought: [What statistical claim or paper do I need to verify?]\n"
+        "  Action:  [Google Search('arxiv <topic> OOS validation 2024 2025')]\n"
+        "  Observation: [Search results]\n"
+        "  ... (repeat for each section requiring evidence)\n"
+        "  Final Answer: [Full CTO Validation Report below]\n\n"
+        "MANDATORY: Search for and cite at least 3 recent papers (2023-2025) per report section.\n\n"
+        "Final Answer must contain:\n"
+        "1. OOS Gate Criteria (Gate 1 + Gate 2 exact thresholds with mathematical derivation)\n"
         "2. Statistical Validity Review (feature assumptions, BEP derivation, calibration plan)\n"
         "3. Regime Theory Analysis (when does the 13-dim feature set fail?)\n"
-        "4. Latest Research References (cite papers found via search that are directly relevant)\n"
+        "4. Latest Research (>=3 papers: Author (Year). Title. arxiv:ID)\n"
         "5. Recommended Implementation Sequence (ordered by risk-adjusted priority)\n"
         "6. Fallback Plan (if Gate 1 fails)\n"
-        "English only. Plain text. Max 500 words. Be mathematically precise. Cite sources."
+        "English only. Plain text. Max 600 words. Mathematically precise."
     )
     usr_p = (
         f"STRATEGY PLAN:\n{plan[:1500]}\n\n"
         f"YOUR ASSIGNED TASKS:\n{tasks_str}\n\n"
         "Write the CTO Validation Report now."
     )
-    report = call_claude(VIKTOR, sys_p, usr_p, allow_tools=True, timeout=360)
+    report = call_claude(VIKTOR, sys_p, usr_p, allow_tools=True, timeout=360,
+                         tier="viktor_solo")
     _save("cto_validation_report", "Viktor", "CTO", report)
     _du("Viktor", status="DONE", task="CTO validation report complete")
     _dl("Phase 4.5 complete")
@@ -1390,9 +1687,110 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 4.7: 3-Perspective Risk Debate (TradingAgents 패턴)
+# ─────────────────────────────────────────────────────────────
+def run_risk_debate(plan: str, alpha_sum: str, beta_sum: str, cto_sum: str) -> str:
+    """
+    스프린트 완료 후 3-perspective 리스크 토론.
+    Radi (공격적) ↔ Jose (보수적) ↔ Viktor (수학적 중립)
+    2라운드 × 3 exchanges = 6 API calls
+    → Demis final report에 risk_summary로 포함
+    """
+    _DASH and _DASH.update("", phase="Phase 4.7 · Risk Debate")
+    _dl("Post-sprint 3-Perspective Risk Debate: Radi(Agg) ↔ Jose(Cons) ↔ Viktor(Neutral)")
+
+    JOSE_AGENT = next((m for m in ALPHA_MEMBERS if m["name"] == "Jose"), ALPHA_MEMBERS[2])
+    ROUNDS = 2
+
+    sprint_ctx = (
+        f"ALPHA SPRINT RESULTS:\n{alpha_sum[:350]}\n\n"
+        f"BETA SPRINT RESULTS:\n{beta_sum[:350]}\n\n"
+        f"CTO SPRINT RESULTS:\n{cto_sum[:350]}"
+    )
+
+    agg_history:  list = []
+    cons_history: list = []
+    neut_history: list = []
+
+    for r in range(ROUNDS):
+        # Aggressive (Radi)
+        agg_user = (
+            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
+            + (f"Conservative's last position:\n{cons_history[-1][:200]}\n\n" if cons_history else "")
+            + "State your aggressive risk position. Why can we increase exposure? 4 sentences."
+        )
+        _du("Radi", status="SPEAKING", task=f"Risk debate R{r+1} Aggressive")
+        agg_resp = call_claude(
+            RADI, _RISK_PERSONAS["aggressive"], agg_user,
+            timeout=180, tier="risk_debate")
+        agg_history.append(agg_resp)
+        _dc("Radi", f"[RISK-AGG R{r+1}] {agg_resp}")
+        _dl(f"[Risk debate R{r+1}] Radi (Aggressive) done")
+
+        # Conservative (Jose)
+        cons_user = (
+            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
+            f"Aggressive argued:\n{agg_resp[:200]}\n\n"
+            "Counter with your conservative risk position. What are the risks? 4 sentences."
+        )
+        _du("Jose", status="SPEAKING", task=f"Risk debate R{r+1} Conservative")
+        cons_resp = call_claude(
+            JOSE_AGENT, _RISK_PERSONAS["conservative"], cons_user,
+            timeout=180, tier="risk_debate")
+        cons_history.append(cons_resp)
+        _dc("Jose", f"[RISK-CON R{r+1}] {cons_resp}")
+        _dl(f"[Risk debate R{r+1}] Jose (Conservative) done")
+
+        # Neutral (Viktor)
+        neut_user = (
+            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
+            f"Aggressive: {agg_resp[:150]}\n"
+            f"Conservative: {cons_resp[:150]}\n\n"
+            "Provide mathematical neutral arbitration. "
+            "Show Kelly Criterion derivation, EV, statistical significance. 4 sentences."
+        )
+        _du("Viktor", status="SPEAKING", task=f"Risk debate R{r+1} Neutral")
+        neut_resp = call_claude(
+            VIKTOR, _RISK_PERSONAS["neutral"], neut_user,
+            timeout=180, allow_tools=True, tier="risk_debate")
+        neut_history.append(neut_resp)
+        _dc("Viktor", f"[RISK-NEU R{r+1}] {neut_resp}")
+        _dl(f"[Risk debate R{r+1}] Viktor (Neutral) done")
+
+    # Fund Manager verdict (Flash)
+    verdict_agent = {"name": "Demis", "model": MODEL_TIER["signal_extract"],
+                     "codex": "CEO", "role": "CEO", "dept": "Executive"}
+    verdict_prompt = (
+        "You are Demis (Fund Manager). Review this 3-perspective risk debate and issue the FINAL RISK VERDICT.\n"
+        "Output format (exactly):\n"
+        "RISK VERDICT: [INCREASE / MAINTAIN / REDUCE] position sizing\n"
+        "RATIONALE: (2 sentences — cite the strongest argument from the debate)\n"
+        "CONSTRAINTS: (specific BEP/WR/MDD/leverage numbers to enforce going forward)\n\n"
+        "AGGRESSIVE (Radi):\n" + "\n---\n".join(agg_history) +
+        "\n\nCONSERVATIVE (Jose):\n" + "\n---\n".join(cons_history) +
+        "\n\nNEUTRAL/MATHEMATICAL (Viktor):\n" + "\n---\n".join(neut_history)
+    )
+    verdict = call_gemini(verdict_agent, verdict_prompt, MODEL_TIER["signal_extract"], 120)
+
+    full_report = (
+        "# Risk Debate Report\n\n"
+        "## Aggressive (Radi)\n" + "\n\n".join(agg_history) +
+        "\n\n## Conservative (Jose)\n" + "\n\n".join(cons_history) +
+        "\n\n## Neutral/Mathematical (Viktor)\n" + "\n\n".join(neut_history) +
+        f"\n\n## Fund Manager Verdict\n{verdict}"
+    )
+    _save("risk_debate_report", "Council", "RiskDebate", full_report)
+    _dl("Risk debate complete")
+    if _CP:
+        _CP.mark("risk_debate", risk_verdict=verdict)
+    return f"{full_report}\n\n---\nVERDICT: {verdict}"
+
+
+# ─────────────────────────────────────────────────────────────
 # Phase 5: Demis → 최종 보고서 (사용자에게)
 # ─────────────────────────────────────────────────────────────
-def demis_final_report(plan: str, alpha_summary: str, beta_summary: str, cto_summary: str = "") -> str:
+def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
+                       cto_summary: str = "", risk_summary: str = "") -> str:
     _DASH and _DASH.update("", phase="Phase 5 · Demis Final Report")
     _du("Demis", task="최종 보고서 작성 중")
     _dl("Phase 5 — Demis writing final report")
@@ -1409,21 +1807,25 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str, cto_sum
         "- Team Beta: ...\n"
         "- CTO (Viktor): ...\n\n"
         "## Key Decisions Made\n\n"
+        "## Risk Verdict (from 3-perspective debate)\n\n"
         "## Research & Papers Referenced (papers cited by teams this sprint)\n\n"
         "## Next Steps (max 5 bullets)\n\n"
         "## Blockers / Risks\n\n"
         "---\n"
         "Report compiled by Demis (CEO)"
     )
+    risk_section = f"\n\nRISK DEBATE VERDICT:\n{risk_summary[:800]}" if risk_summary else ""
     user = (
         f"STRATEGY PLAN:\n{plan[:1000]}\n\n"
         f"TEAM ALPHA SPRINT:\n{alpha_summary}\n\n"
         f"TEAM BETA SPRINT:\n{beta_summary}\n\n"
         f"CTO (VIKTOR) SPRINT:\n{cto_summary}\n\n"
+        f"{risk_section}\n\n"
         f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         "Write the final report for the project owner."
     )
-    report = call_claude(DEMIS, system, user, allow_tools=True, timeout=240)
+    report = call_claude(DEMIS, system, user, allow_tools=True, timeout=240,
+                         tier="demis_report")
     _save("final_report", "Demis", "Executive", report)
     _dl("Final report complete")
     if _CP:
@@ -1435,13 +1837,13 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str, cto_sum
 # ─────────────────────────────────────────────────────────────
 # Sprint execution helper (shared by normal run + resume)
 # ─────────────────────────────────────────────────────────────
-def _run_sprints(plan: str, approved_map: dict) -> tuple[str, str, str]:
-    """Execute all team sprints in parallel. Returns (alpha, beta, cto) summaries."""
+def _run_sprints(plan: str, approved_map: dict) -> tuple[str, str, str, str]:
+    """Execute all team sprints in parallel, then run risk debate. Returns (alpha, beta, cto, risk) summaries."""
     alpha_sum = beta_sum = cto_sum = "[SKIPPED]"
 
     if approved_map is None:
         _dl("All sprints aborted — proceeding to final report")
-        return alpha_sum, beta_sum, cto_sum
+        return alpha_sum, beta_sum, cto_sum, "[SKIPPED]"
 
     results: dict[str, str] = {}
     sprint_lock = threading.Lock()
@@ -1473,7 +1875,19 @@ def _run_sprints(plan: str, approved_map: dict) -> tuple[str, str, str]:
     for t in threads: t.start()
     for t in threads: t.join()
 
-    return results.get("alpha", alpha_sum), results.get("beta", beta_sum), results.get("cto", cto_sum)
+    alpha_sum = results.get("alpha", alpha_sum)
+    beta_sum  = results.get("beta",  beta_sum)
+    cto_sum   = results.get("cto",   cto_sum)
+
+    # Phase 4.7: 3-perspective risk debate (after all sprints complete)
+    if approved_map is not None and any(
+        approved_map.get(k) is not None for k in ["Radi", "Casandra", "Viktor"]
+    ):
+        risk_sum = run_risk_debate(plan, alpha_sum, beta_sum, cto_sum)
+    else:
+        risk_sum = "[SKIPPED]"
+
+    return alpha_sum, beta_sum, cto_sum, risk_sum
 
 
 def _print_final(final: str):
@@ -1607,14 +2021,51 @@ def main():
     with _DASH:
         _dl("Orchestration initialized")
 
-        transcript = run_grand_council(agenda, problem)
-        plan, task_map = demis_synthesize(transcript)
+        # Phase 0: Retrieve similar past sessions for context
+        memory_ctx = _MEM.retrieve_similar(agenda)
+        if memory_ctx:
+            _dl(f"Memory: {memory_ctx.count(chr(10))} lines of past session context loaded")
+
+        # Phase 0.5: Adversarial Pre-Council Debate (Radi↔Viktor)
+        adv_result = run_adversarial_debate(agenda, problem)
+
+        # Phase 1: Grand Council (with adv context + memory injected)
+        transcript = run_grand_council(agenda, problem,
+                                       adv_result=adv_result, memory_ctx=memory_ctx)
+
+        # Phase 2: Demis synthesis (with memory context)
+        plan, task_map = demis_synthesize(transcript, memory_ctx=memory_ctx)
         approved_map = review_plan(plan, task_map)
-        alpha_sum, beta_sum, cto_sum = _run_sprints(plan, approved_map)
-        final = demis_final_report(plan, alpha_sum, beta_sum, cto_sum)
+
+        # Phase 3/4: Team sprints + Phase 4.7: Risk debate
+        alpha_sum, beta_sum, cto_sum, risk_sum = _run_sprints(plan, approved_map)
+
+        # Phase 5: Final report (with risk verdict)
+        final = demis_final_report(plan, alpha_sum, beta_sum, cto_sum, risk_sum)
 
         _DASH.update("", phase="COMPLETE")
         _dl("All phases complete")
+
+    # Save session to memory for future runs
+    decisions = []
+    if _CP and _CP.data:
+        adv_disputes = _CP.data.get("adversarial_disputes", "")
+        risk_verdict = _CP.data.get("risk_verdict", "")
+        if adv_disputes:
+            decisions.append(f"Pre-debate disputes: {adv_disputes[:150]}")
+        if risk_verdict:
+            decisions.append(f"Risk verdict: {risk_verdict[:150]}")
+    _MEM.store(
+        session_id=_CP.data.get("session_id", str(uuid.uuid4())) if _CP else str(uuid.uuid4()),
+        agenda=agenda,
+        decisions=decisions,
+        sprint_outcomes={
+            "alpha": alpha_sum[:200] if alpha_sum else "",
+            "beta":  beta_sum[:200]  if beta_sum  else "",
+            "cto":   cto_sum[:200]   if cto_sum   else "",
+            "risk":  risk_sum[:200]  if risk_sum  else "",
+        }
+    )
 
     _archive_agenda()
     _print_final(final)
@@ -1700,7 +2151,12 @@ def _resume_from_checkpoint():
             beta_sum  = resume_results.get("beta",  beta_sum)
             cto_sum   = resume_results.get("cto",   cto_sum)
 
-        final = demis_final_report(plan, alpha_sum, beta_sum, cto_sum)
+        # Risk debate if sprints ran
+        if any(s not in ("[SKIPPED]", "") for s in [alpha_sum, beta_sum, cto_sum]):
+            risk_sum = run_risk_debate(plan, alpha_sum, beta_sum, cto_sum)
+        else:
+            risk_sum = "[SKIPPED]"
+        final = demis_final_report(plan, alpha_sum, beta_sum, cto_sum, risk_sum)
         _DASH.update("", phase="COMPLETE")
         _dl("Resume complete")
 
@@ -1729,8 +2185,8 @@ def _do_resprint(plan_path: "Path"):
     _DASH.register(ALL_AGENTS)
     with _DASH:
         approved_map = task_map  # all leads approved
-        alpha_sum, beta_sum, cto_sum = _run_sprints(plan_text, approved_map)
-        final = demis_final_report(plan_text, alpha_sum, beta_sum, cto_sum)
+        alpha_sum, beta_sum, cto_sum, risk_sum = _run_sprints(plan_text, approved_map)
+        final = demis_final_report(plan_text, alpha_sum, beta_sum, cto_sum, risk_sum)
         _DASH.update("", phase="COMPLETE")
         _dl("Re-sprint complete")
     _print_final(final)
@@ -1838,7 +2294,12 @@ def _run_from_last_result(session: dict):
             beta_sum  = lr_results.get("beta",  beta_sum)
             cto_sum   = lr_results.get("cto",   cto_sum)
 
-        final = demis_final_report(plan_text, alpha_sum, beta_sum, cto_sum)
+        # Risk debate if sprints ran
+        if any(s not in ("[SKIPPED]", "") for s in [alpha_sum, beta_sum, cto_sum]):
+            risk_sum = run_risk_debate(plan_text, alpha_sum, beta_sum, cto_sum)
+        else:
+            risk_sum = "[SKIPPED]"
+        final = demis_final_report(plan_text, alpha_sum, beta_sum, cto_sum, risk_sum)
         _DASH.update("", phase="COMPLETE")
         _dl("Resume complete")
 

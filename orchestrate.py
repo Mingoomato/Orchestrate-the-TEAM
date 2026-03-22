@@ -61,6 +61,15 @@ def _archive_agenda() -> None:
 import platform as _platform
 import google.generativeai as genai
 
+# ── Research Tools (arXiv + OpenAlex + Crossref) ─────────────
+try:
+    from research_tools import search_papers, format_papers_for_prompt
+    _RESEARCH_AVAILABLE = True
+except ImportError:
+    _RESEARCH_AVAILABLE = False
+    def search_papers(*a, **k): return []
+    def format_papers_for_prompt(*a, **k): return ""
+
 # ─────────────────────────────────────────────────────────────
 # Gemini API 설정
 # ─────────────────────────────────────────────────────────────
@@ -1343,10 +1352,33 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         "  Action: Google Search('arxiv <topic> quant finance 2024 2025')\n"
         "  Observation: [search results]\n"
     )
+    # ── Research context (parallel, non-blocking) ───────────────
+    _research_ctx = [""]
+    def _fetch_research():
+        try:
+            role_lower = member.get("role", "").lower()
+            if any(k in role_lower for k in ("quant", "ml", "risk", "backtest", "strategy", "quantum")):
+                fields = ["qfin", "math", "cs"]
+            elif "data" in role_lower:
+                fields = ["cs", "qfin"]
+            else:
+                fields = ["qfin", "cs"]
+            papers = search_papers(task, fields=fields, max_total=5)
+            _research_ctx[0] = format_papers_for_prompt(papers, max_papers=4)
+        except Exception:
+            pass
+    _rt = threading.Thread(target=_fetch_research, daemon=True)
+    _rt.start()
+    _rt.join(timeout=12)   # 12s 안에 못 가져오면 없이 진행
+
+    research_block = (f"\n\n## Relevant Research Papers\n{_research_ctx[0]}"
+                      if _research_ctx[0] else "")
+
     usr_p = (
         f"## Strategy Plan (summary)\n{plan[:600]}\n\n"
         f"## Lead Assignment\n{kickoff[:400]}\n\n"
-        f"## Your Task\n{task}{revision_note}\n\n"
+        f"## Your Task\n{task}{revision_note}"
+        f"{research_block}\n\n"
         "Implement now."
     )
     agent = {
@@ -1671,9 +1703,25 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
         "6. Fallback Plan (if Gate 1 fails)\n"
         "English only. Plain text. Max 600 words. Mathematically precise."
     )
+    # ── Pre-fetch research for Viktor (math + qfin + physics) ──
+    _viktor_research = [""]
+    def _fetch_viktor_research():
+        try:
+            papers = search_papers(tasks_str, fields=["math", "qfin", "physics", "cs"],
+                                   max_total=8)
+            _viktor_research[0] = format_papers_for_prompt(papers, max_papers=6)
+        except Exception:
+            pass
+    _vrt = threading.Thread(target=_fetch_viktor_research, daemon=True)
+    _vrt.start()
+    _vrt.join(timeout=15)
+    research_block = (f"\n\n## Pre-fetched Research (arXiv + OpenAlex + Crossref)\n"
+                      f"{_viktor_research[0]}" if _viktor_research[0] else "")
+
     usr_p = (
         f"STRATEGY PLAN:\n{plan[:1500]}\n\n"
-        f"YOUR ASSIGNED TASKS:\n{tasks_str}\n\n"
+        f"YOUR ASSIGNED TASKS:\n{tasks_str}"
+        f"{research_block}\n\n"
         "Write the CTO Validation Report now."
     )
     report = call_claude(VIKTOR, sys_p, usr_p, allow_tools=True, timeout=360,

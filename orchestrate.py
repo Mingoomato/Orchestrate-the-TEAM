@@ -26,6 +26,7 @@ Orchestration System v5 — Quantum Trading Council (TradingAgents-Enhanced)
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -250,6 +251,16 @@ class SessionMemory:
 
 _CP:  Checkpoint | None = None   # global checkpoint instance
 _MEM: SessionMemory = SessionMemory()  # global memory instance
+
+def _sigint_handler(_sig, _frame):
+    print("\n\n  [Interrupted — saving checkpoint...]")
+    if _CP:
+        _CP.save()
+        print(f"  [Checkpoint saved → {CHECKPOINT_FILE}]")
+        print("  [Resume with: python orchestrate.py → r]")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _sigint_handler)
 
 
 def _scan_last_session() -> dict:

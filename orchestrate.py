@@ -83,7 +83,7 @@ try:
     from memory_layer import (
         save_session, save_agent_memory, update_task_status,
         get_agent_history, search_memory,
-        format_agent_history, github_push_async,
+        format_agent_history, github_push_async, github_sync_to_db,
     )
     _MEMORY_LAYER_AVAILABLE = True
 except ImportError:
@@ -95,6 +95,7 @@ except ImportError:
     def search_memory(*a, **k): return []
     def format_agent_history(*a, **k): return ""
     def github_push_async(*a, **k): pass
+    def github_sync_to_db(*a, **k): return 0
 
 # ─────────────────────────────────────────────────────────────
 # Gemini API 설정
@@ -107,6 +108,16 @@ except (KeyError, TypeError):
     print("\n  [CRITICAL ERROR] GEMINI_API_KEY environment variable not found.")
     print("  Please set the 'GEMINI_API_KEY' environment variable for the script to function.")
     sys.exit(1)
+
+# ── GitHub → SQLite sync at startup (background, non-blocking) ──
+def _startup_github_sync():
+    try:
+        n = github_sync_to_db()
+        if n > 0:
+            print(f"  [Memory sync: {n} new session(s) imported from GitHub]")
+    except Exception:
+        pass
+threading.Thread(target=_startup_github_sync, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────

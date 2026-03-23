@@ -1801,6 +1801,10 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
         "  Observation: [File contents / results]\n"
         "  ... (repeat until you have read all relevant data)\n"
         "  Final Answer: [Full CTO Validation Report]\n\n"
+        "DELIVERABLE CREATION (MANDATORY):\n"
+        "For each task assigned to you, CREATE the actual file on disk using the Write tool.\n"
+        "Example: if task says 'write docs/validation_protocols.md', use Write tool to create that file.\n"
+        "Do NOT just describe what would be in the file — actually write it to disk.\n\n"
         "Final Answer must contain:\n"
         "1. OOS Gate Criteria (Gate 1 + Gate 2 — with actual numbers from the files)\n"
         "2. Statistical Validity Review (based on ACTUAL backtest output you read)\n"
@@ -1808,6 +1812,7 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
         "4. Latest Research (>=3 papers cited)\n"
         "5. Recommended Implementation Sequence\n"
         "6. Fallback Plan\n"
+        "7. List of files created (paths confirmed by Write tool)\n"
         "English only. Mathematically precise. Cite actual file names you read."
     )
     # ── Pre-fetch research for Viktor (math + qfin + physics) ──

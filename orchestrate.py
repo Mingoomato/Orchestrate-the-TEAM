@@ -728,7 +728,8 @@ def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
     """
     try:
         result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6", prompt],
+            ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6"],
+            input=prompt,           # stdin으로 전달 (CLI 인자 한도 우회)
             capture_output=True,
             text=True,
             encoding="utf-8",

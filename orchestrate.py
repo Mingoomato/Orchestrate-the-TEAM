@@ -660,6 +660,13 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
         return result_text
 
     except Exception as e:
+        err_str = str(e)
+        # Rate limit / quota → fallback to gemini-2.5-flash
+        if any(k in err_str for k in ("429", "quota", "RESOURCE_EXHAUSTED", "rate")):
+            fallback = "gemini-2.5-flash"
+            if model_name != fallback:
+                _du(name, status="ACTIVE", msg=f"Rate limit — retrying with {fallback}...")
+                return call_gemini(agent, prompt, fallback, timeout, allow_search)
         error_msg = f"[GEMINI ERROR] {type(e).__name__}: {str(e)}"
         print(f"\nError details for {name}: {error_msg}", file=sys.stderr)
         _du(name, status="ERROR", msg=error_msg[:120])

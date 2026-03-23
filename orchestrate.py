@@ -717,8 +717,15 @@ def _is_execution_task(task: str) -> bool:
     return any(kw in t for kw in _EXEC_KEYWORDS)
 
 
+_CLI_LIMIT_SIGNALS = (
+    "rate limit", "429", "overloaded", "quota", "limit reached",
+    "too many requests", "usage limit", "capacity",
+)
+
 def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
-    """Claude Code CLI (claude --print) subprocess — real Bash/file tool execution."""
+    """Claude Code CLI (claude --print) subprocess — real Bash/file tool execution.
+    Falls back to Gemini 2.5 Pro if Claude hits rate/usage limits.
+    """
     try:
         result = subprocess.run(
             ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6", prompt],
@@ -731,6 +738,15 @@ def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
         )
         out = result.stdout.strip()
         err = result.stderr.strip()
+
+        # Check stdout + stderr for limit signals → fallback to Gemini
+        combined_out = (out + " " + err).lower()
+        if any(sig in combined_out for sig in _CLI_LIMIT_SIGNALS):
+            _dl(f"[CLI→GEMINI] Claude limit detected — falling back to gemini-2.5-pro")
+            return call_gemini(
+                {"name": "CLI-fallback"}, prompt, MODEL_OPUS, timeout, allow_search=False
+            )
+
         if out:
             return out
         if err:
@@ -739,7 +755,11 @@ def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
     except subprocess.TimeoutExpired:
         return f"[TIMEOUT after {timeout}s]"
     except FileNotFoundError:
-        return "[ERROR: 'claude' CLI not found — run: npm install -g @anthropic-ai/claude-code]"
+        # claude CLI not installed → fallback to Gemini directly
+        _dl("[CLI→GEMINI] claude CLI not found — falling back to gemini-2.5-pro")
+        return call_gemini(
+            {"name": "CLI-fallback"}, prompt, MODEL_OPUS, timeout, allow_search=False
+        )
     except Exception as e:
         return f"[ERROR: {e}]"
 

@@ -1016,27 +1016,6 @@ _COUNCIL_RULES = (
 )
 
 
-# Risk debate personas (TradingAgents 3-perspective 패턴)
-_RISK_PERSONAS = {
-    "aggressive": (
-        "You are Radi (Aggressive Risk Advocate). "
-        "Argue for maximizing position size, leverage, and trade frequency given the sprint results. "
-        "Identify which sprint outcomes justify increasing risk exposure. "
-        "English only, plain text, 4 sentences max."
-    ),
-    "conservative": (
-        "You are Jose (Conservative Risk Manager). "
-        "Identify every risk that could cause drawdown exceeding MDD threshold. "
-        "Cite BEP, WR, fee model, kill switch triggers. "
-        "English only, plain text, 4 sentences max."
-    ),
-    "neutral": (
-        "You are Viktor (Neutral Mathematical Arbitrator). "
-        "Evaluate both positions using Kelly Criterion formula, EV calculation, and statistical significance. "
-        "Derive the mathematically optimal risk budget given sprint results. "
-        "Show your derivation. English only, plain text, 4 sentences max."
-    ),
-}
 
 def _council_call(lead: dict, system: str, user: str) -> str:
     """
@@ -1127,93 +1106,67 @@ def _extract_decisions(history: list, existing: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 0.5: Adversarial Pre-Council Debate (TradingAgents 패턴)
+# Phase 0.5: Pre-Council Results Scan (data-driven, replaces BULL/BEAR debate)
 # ─────────────────────────────────────────────────────────────
 def run_adversarial_debate(agenda: str, problem: str) -> dict:
     """
-    Grand Council 전 사전 적대적 토론.
-    Radi (Bull: 알파 옹호) ↔ Viktor (Bear: 통계적 반박)
-    3라운드 × 2 exchanges = 6 API calls
-    → Council 및 Demis synthesis에 key_disputes 주입
+    Grand Council 전 데이터 기반 현황 스캔.
+    토론 대신 실제 백테스트 결과와 Gate 상태를 읽어 컨텍스트 생성.
+    Radi: 지난 백테스트 결과 요약 / Viktor: 수학적 게이트 상태 감사
+    2 API calls (debate 6 → 2로 축소)
     """
-    _DASH and _DASH.update("", phase="Pre-Council · Adversarial Debate")
-    _dl("Pre-Council Adversarial Debate: Radi(Bull) ↔ Viktor(Bear) — 3 rounds")
+    _DASH and _DASH.update("", phase="Pre-Council · Results Scan")
+    _dl("Pre-Council Results Scan: Radi(backtest) + Viktor(gate audit) — data-driven")
 
-    bull_history: list = []
-    bear_history: list = []
-    ROUNDS = 3
-
-    bull_sys = (
+    # Radi — 지난 백테스트 결과 읽기
+    radi_sys = (
         f"{_PERSONAS['Radi']}\n\n{_PROJ_CTX}\n\n"
-        "ROLE IN THIS DEBATE: You are the BULL — argue why this specific system CAN generate "
-        "consistent positive alpha in live trading. Cite specific WR/EV numbers, mechanism "
-        "causality, and market microstructure evidence. "
-        "English only, plain text, 4 sentences max."
+        "ROLE: You are scanning the latest backtest results to brief the council. "
+        "Read available CSV/report files, extract WR, EV/trade, MDD, Sharpe. "
+        "State facts only — no opinion. English, 5 bullet points max."
     )
-    bear_sys = (
+    radi_user = (
+        f"Agenda: {agenda[:300]}\n\n"
+        "Scan the most recent backtest output files (reports/, project_output/) "
+        "and summarize the key performance numbers: WR, EV, MDD, trade count, Gate 1/2 status. "
+        "If no backtest files exist, state that clearly."
+    )
+    _du("Radi", status="SCANNING", task="Pre-council backtest scan")
+    radi_scan = call_claude_cli(
+        f"{radi_sys}\n\n{radi_user}", timeout=180
+    )
+    _dc("Radi", f"[SCAN] {radi_scan}")
+    _dl("Pre-council: Radi backtest scan done")
+
+    # Viktor — Gate 상태 및 수학적 현황 감사
+    viktor_sys = (
         f"{_PERSONAS['Viktor']}\n\n{_PROJ_CTX}\n\n"
-        "ROLE IN THIS DEBATE: You are the BEAR — identify the single most critical "
-        "flaw, statistical risk, or implementation failure mode that will prevent this "
-        "system from generating alpha in live trading. Cite specific numbers, papers, "
-        "or derivations. English only, plain text, 4 sentences max."
+        "ROLE: You are auditing the mathematical state of the system before council. "
+        "Check validation gate files, checkpoint status, and feature pipeline integrity. "
+        "Report facts with numbers. English, 5 bullet points max."
     )
-
-    for r in range(ROUNDS):
-        # Bull turn (Radi)
-        bear_last = bear_history[-1] if bear_history else ""
-        bull_user = (
-            f"Round {r+1}/{ROUNDS}. Agenda excerpt: {agenda[:300]}\n\n"
-            + (f"Bear's last argument:\n{bear_last[:250]}\n\n" if bear_last else "")
-            + "State your strongest bull argument for why this system will generate alpha. 4 sentences max."
-        )
-        _du("Radi", status="SPEAKING", task=f"Pre-debate R{r+1} Bull")
-        bull_resp = call_claude(RADI, bull_sys, bull_user,
-                                timeout=240, allow_tools=True, tier="adversarial")
-        bull_history.append(bull_resp)
-        _dc("Radi", f"[BULL R{r+1}] {bull_resp}")
-        _dl(f"[Pre-debate R{r+1}] Radi (Bull) done")
-
-        # Bear turn (Viktor)
-        bear_user = (
-            f"Round {r+1}/{ROUNDS}. Agenda excerpt: {agenda[:300]}\n\n"
-            f"Bull's argument:\n{bull_resp[:250]}\n\n"
-            "Counter with your strongest bear argument — specific flaw, number, or derivation. 4 sentences max."
-        )
-        _du("Viktor", status="SPEAKING", task=f"Pre-debate R{r+1} Bear")
-        bear_resp = call_claude(VIKTOR, bear_sys, bear_user,
-                                timeout=240, allow_tools=True, tier="adversarial")
-        bear_history.append(bear_resp)
-        _dc("Viktor", f"[BEAR R{r+1}] {bear_resp}")
-        _dl(f"[Pre-debate R{r+1}] Viktor (Bear) done")
-
-    # 핵심 쟁점 요약 (Flash — 빠른 처리)
-    summary_agent = {"name": "Demis", "model": MODEL_TIER["signal_extract"],
-                     "codex": "CEO", "role": "CEO", "dept": "Executive"}
-    summary_prompt = (
-        "Summarize the following bull/bear pre-council debate in 5 bullet points.\n"
-        "Focus ONLY on UNRESOLVED disputes and their technical core.\n"
-        "Format: DISPUTED: <bull claim> vs <bear counter>\n\n"
-        "BULL:\n" + "\n---\n".join(bull_history) +
-        "\n\nBEAR:\n" + "\n---\n".join(bear_history)
+    viktor_user = (
+        f"Agenda: {agenda[:300]}\n\n"
+        "Check: (1) backtesting/validation.py Gate 1/2 thresholds, "
+        "(2) latest checkpoint file in checkpoints/, "
+        "(3) any existing validation results or r-multiple CSVs. "
+        "Report what exists and what is missing."
     )
-    key_disputes = call_gemini(summary_agent, summary_prompt,
-                               MODEL_TIER["signal_extract"], 120)
-    _dl("Pre-council adversarial debate complete")
+    _du("Viktor", status="AUDITING", task="Pre-council gate audit")
+    viktor_scan = call_claude_cli(
+        f"{viktor_sys}\n\n{viktor_user}", timeout=180
+    )
+    _dc("Viktor", f"[AUDIT] {viktor_scan}")
+    _dl("Pre-council: Viktor gate audit done")
 
-    result = {
-        "bull_history": bull_history,
-        "bear_history": bear_history,
-        "key_disputes": key_disputes,
-    }
-    _save("pre_council_adversarial_debate", "Council", "PreCouncil",
-          "# Pre-Council Adversarial Debate\n\n"
-          "## Bull (Radi)\n" + "\n\n".join(bull_history) +
-          "\n\n## Bear (Viktor)\n" + "\n\n".join(bear_history) +
-          "\n\n## Key Disputes\n" + key_disputes)
+    key_facts = f"BACKTEST STATE (Radi):\n{radi_scan}\n\nGATE AUDIT (Viktor):\n{viktor_scan}"
+    _save("pre_council_results_scan", "Council", "PreCouncil",
+          f"# Pre-Council Results Scan\n\n## Backtest State (Radi)\n{radi_scan}"
+          f"\n\n## Gate Audit (Viktor)\n{viktor_scan}")
 
     if _CP:
-        _CP.mark("adversarial_debate", adversarial_disputes=key_disputes)
-    return result
+        _CP.mark("adversarial_debate", adversarial_disputes=key_facts[:300])
+    return {"key_disputes": key_facts, "radi_scan": radi_scan, "viktor_scan": viktor_scan}
 
 
 def run_grand_council(agenda: str, problem: str,
@@ -1227,7 +1180,7 @@ def run_grand_council(agenda: str, problem: str,
     memory_ctx: similar past sessions from SessionMemory — injected into system prompts.
     """
     global _CODE_DIGEST, _ADV_CONTEXT, _MEMORY_CONTEXT
-    MAX_ROUNDS = 3
+    MAX_ROUNDS = 0  # Debate rounds disabled — opening statements + Demis synthesis only
     SEP = "─" * 70
 
     # Build code digest once — injected into every council call
@@ -1932,103 +1885,48 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 4.7: 3-Perspective Risk Debate (TradingAgents 패턴)
+# Phase 4.7: Viktor Risk Audit (replaces 3-perspective debate)
 # ─────────────────────────────────────────────────────────────
 def run_risk_debate(plan: str, alpha_sum: str, beta_sum: str, cto_sum: str) -> str:
     """
-    스프린트 완료 후 3-perspective 리스크 토론.
-    Radi (공격적) ↔ Jose (보수적) ↔ Viktor (수학적 중립)
-    2라운드 × 3 exchanges = 6 API calls
-    → Demis final report에 risk_summary로 포함
+    스프린트 완료 후 Viktor 단독 수학적 리스크 감사.
+    토론 대신 실제 백테스트 숫자 기반 Kelly fraction + Gate 판정.
+    1 API call (debate 6 → 1로 축소)
     """
-    _DASH and _DASH.update("", phase="Phase 4.7 · Risk Debate")
-    _dl("Post-sprint 3-Perspective Risk Debate: Radi(Agg) ↔ Jose(Cons) ↔ Viktor(Neutral)")
-
-    JOSE_AGENT = next((m for m in ALPHA_MEMBERS if m["name"] == "Jose"), ALPHA_MEMBERS[2])
-    ROUNDS = 2
+    _DASH and _DASH.update("", phase="Phase 4.7 · Risk Audit")
+    _dl("Post-sprint Viktor Risk Audit — data-driven Kelly + Gate verdict")
 
     sprint_ctx = (
-        f"ALPHA SPRINT RESULTS:\n{alpha_sum[:350]}\n\n"
-        f"BETA SPRINT RESULTS:\n{beta_sum[:350]}\n\n"
-        f"CTO SPRINT RESULTS:\n{cto_sum[:350]}"
+        f"ALPHA SPRINT RESULTS:\n{alpha_sum[:500]}\n\n"
+        f"BETA SPRINT RESULTS:\n{beta_sum[:500]}\n\n"
+        f"CTO SPRINT RESULTS:\n{cto_sum[:500]}"
     )
 
-    agg_history:  list = []
-    cons_history: list = []
-    neut_history: list = []
-
-    for r in range(ROUNDS):
-        # Aggressive (Radi)
-        agg_user = (
-            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
-            + (f"Conservative's last position:\n{cons_history[-1][:200]}\n\n" if cons_history else "")
-            + "State your aggressive risk position. Why can we increase exposure? 4 sentences."
-        )
-        _du("Radi", status="SPEAKING", task=f"Risk debate R{r+1} Aggressive")
-        agg_resp = call_claude(
-            RADI, _RISK_PERSONAS["aggressive"], agg_user,
-            timeout=180, tier="risk_debate")
-        agg_history.append(agg_resp)
-        _dc("Radi", f"[RISK-AGG R{r+1}] {agg_resp}")
-        _dl(f"[Risk debate R{r+1}] Radi (Aggressive) done")
-
-        # Conservative (Jose)
-        cons_user = (
-            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
-            f"Aggressive argued:\n{agg_resp[:200]}\n\n"
-            "Counter with your conservative risk position. What are the risks? 4 sentences."
-        )
-        _du("Jose", status="SPEAKING", task=f"Risk debate R{r+1} Conservative")
-        cons_resp = call_claude(
-            JOSE_AGENT, _RISK_PERSONAS["conservative"], cons_user,
-            timeout=180, tier="risk_debate")
-        cons_history.append(cons_resp)
-        _dc("Jose", f"[RISK-CON R{r+1}] {cons_resp}")
-        _dl(f"[Risk debate R{r+1}] Jose (Conservative) done")
-
-        # Neutral (Viktor)
-        neut_user = (
-            f"Round {r+1}/{ROUNDS}. Sprint Results:\n{sprint_ctx}\n\n"
-            f"Aggressive: {agg_resp[:150]}\n"
-            f"Conservative: {cons_resp[:150]}\n\n"
-            "Provide mathematical neutral arbitration. "
-            "Show Kelly Criterion derivation, EV, statistical significance. 4 sentences."
-        )
-        _du("Viktor", status="SPEAKING", task=f"Risk debate R{r+1} Neutral")
-        neut_resp = call_claude(
-            VIKTOR, _RISK_PERSONAS["neutral"], neut_user,
-            timeout=180, allow_tools=True, tier="risk_debate")
-        neut_history.append(neut_resp)
-        _dc("Viktor", f"[RISK-NEU R{r+1}] {neut_resp}")
-        _dl(f"[Risk debate R{r+1}] Viktor (Neutral) done")
-
-    # Fund Manager verdict (Flash)
-    verdict_agent = {"name": "Demis", "model": MODEL_TIER["signal_extract"],
-                     "codex": "CEO", "role": "CEO", "dept": "Executive"}
-    verdict_prompt = (
-        "You are Demis (Fund Manager). Review this 3-perspective risk debate and issue the FINAL RISK VERDICT.\n"
-        "Output format (exactly):\n"
-        "RISK VERDICT: [INCREASE / MAINTAIN / REDUCE] position sizing\n"
-        "RATIONALE: (2 sentences — cite the strongest argument from the debate)\n"
-        "CONSTRAINTS: (specific BEP/WR/MDD/leverage numbers to enforce going forward)\n\n"
-        "AGGRESSIVE (Radi):\n" + "\n---\n".join(agg_history) +
-        "\n\nCONSERVATIVE (Jose):\n" + "\n---\n".join(cons_history) +
-        "\n\nNEUTRAL/MATHEMATICAL (Viktor):\n" + "\n---\n".join(neut_history)
+    viktor_sys = (
+        f"{_PERSONAS['Viktor']}\n\n{_PROJ_CTX}\n\n"
+        "ROLE: Post-sprint mathematical risk auditor. Read actual backtest output files, "
+        "compute Kelly fraction, verify Gate 1/2 status. No debate — only numbers and verdicts."
     )
-    verdict = call_gemini(verdict_agent, verdict_prompt, MODEL_TIER["signal_extract"], 120)
-
-    full_report = (
-        "# Risk Debate Report\n\n"
-        "## Aggressive (Radi)\n" + "\n\n".join(agg_history) +
-        "\n\n## Conservative (Jose)\n" + "\n\n".join(cons_history) +
-        "\n\n## Neutral/Mathematical (Viktor)\n" + "\n\n".join(neut_history) +
-        f"\n\n## Fund Manager Verdict\n{verdict}"
+    viktor_user = (
+        f"Sprint results summary:\n{sprint_ctx}\n\n"
+        "Using actual files in reports/ and project_output/, perform the risk audit:\n"
+        "1. Read the latest r-multiple CSV. Compute: WR, avg_W, avg_L, EV/trade.\n"
+        "2. Gate 1: WR > 25.4% (BEP)? PASS/FAIL.\n"
+        "3. Gate 2: Bootstrap p-value < 0.05 on mean R-multiple > 0? PASS/FAIL.\n"
+        "4. Kelly fraction: f* = (p/|SL| - q/|TP|) where p=WR, q=1-WR, TP=3×ATR, SL=1×ATR.\n"
+        "5. VERDICT: INCREASE / MAINTAIN / REDUCE position sizing — one word + one sentence rationale.\n"
+        "If no backtest files exist, state that clearly and output VERDICT: MAINTAIN (no data)."
     )
-    _save("risk_debate_report", "Council", "RiskDebate", full_report)
-    _dl("Risk debate complete")
+    _du("Viktor", status="AUDITING", task="Post-sprint risk audit")
+    verdict = call_claude_cli(f"{viktor_sys}\n\n{viktor_user}", timeout=240)
+    _dc("Viktor", f"[RISK-AUDIT] {verdict}")
+    _dl("Risk audit complete")
+
+    full_report = f"# Risk Audit Report\n\n## Viktor Mathematical Risk Audit\n{verdict}"
+    _save("risk_audit_report", "Council", "RiskAudit", full_report)
     if _CP:
-        _CP.mark("risk_debate", risk_verdict=verdict)
-    return f"{full_report}\n\n---\nVERDICT: {verdict}"
+        _CP.mark("risk_debate", risk_verdict=verdict[:200])
+    return full_report
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2058,7 +1956,7 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
         "- Team Beta: ...\n"
         "- CTO (Viktor): ...\n\n"
         "## Key Decisions Made\n\n"
-        "## Risk Verdict (from 3-perspective debate)\n\n"
+        "## Risk Verdict (Viktor audit — Kelly fraction + Gate verdict)\n\n"
         "## Research & Papers Referenced\n\n"
         "## Next Steps (max 5 bullets)\n\n"
         "## Blockers / Risks\n\n"

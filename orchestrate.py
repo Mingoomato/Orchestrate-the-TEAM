@@ -70,6 +70,24 @@ except ImportError:
     def search_papers(*a, **k): return []
     def format_papers_for_prompt(*a, **k): return ""
 
+# ── Cross-Session Memory (SQLite + ChromaDB) ─────────────────
+try:
+    from memory_layer import (
+        save_session, save_agent_memory, update_task_status,
+        get_agent_history, search_memory,
+        format_agent_history, github_push_async,
+    )
+    _MEMORY_LAYER_AVAILABLE = True
+except ImportError:
+    _MEMORY_LAYER_AVAILABLE = False
+    def save_session(*a, **k): pass
+    def save_agent_memory(*a, **k): pass
+    def update_task_status(*a, **k): pass
+    def get_agent_history(*a, **k): return []
+    def search_memory(*a, **k): return []
+    def format_agent_history(*a, **k): return ""
+    def github_push_async(*a, **k): pass
+
 # ─────────────────────────────────────────────────────────────
 # Gemini API 설정
 # ─────────────────────────────────────────────────────────────
@@ -626,6 +644,59 @@ def call_codex(member: dict, prompt: str, timeout: int = 300) -> str:
         "model": MODEL_OPUS,
     }
     return call_gemini(agent_dict, prompt, MODEL_OPUS, timeout)
+
+
+
+# ─────────────────────────────────────────────────────────────
+# Part B — Execution Task Detection + Claude Code CLI Executor
+# ─────────────────────────────────────────────────────────────
+_EXEC_KEYWORDS = {
+    "run", "execute", "backtest", "validate", "test", "measure",
+    "script", "result", "gate", "check", "verify", "calculate",
+    "compute", "analyze", "analyse", "benchmark", "evaluate",
+    "perform", "conduct", "output", "generate report",
+}
+
+def _is_execution_task(task: str) -> bool:
+    """Return True if task requires actual script execution (not just code writing)."""
+    t = task.lower()
+    return any(kw in t for kw in _EXEC_KEYWORDS)
+
+
+def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
+    """Claude Code CLI (claude --print) subprocess — real Bash/file tool execution."""
+    try:
+        result = subprocess.run(
+            ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6", prompt],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(cwd or WORKSPACE),
+            timeout=timeout,
+        )
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        if out:
+            return out
+        if err:
+            return f"[STDERR] {err}"
+        return "[NO OUTPUT]"
+    except subprocess.TimeoutExpired:
+        return f"[TIMEOUT after {timeout}s]"
+    except FileNotFoundError:
+        return "[ERROR: 'claude' CLI not found — run: npm install -g @anthropic-ai/claude-code]"
+    except Exception as e:
+        return f"[ERROR: {e}]"
+
+
+def call_claude_exec(member: dict, system_prompt: str, user_prompt: str,
+                     timeout: int = 600) -> str:
+    """Part B: Claude Code CLI subprocess — real Bash/Read/Write/Glob tool execution."""
+    combined = f"[SYSTEM ROLE]\n{system_prompt}\n\n[TASK]\n{user_prompt}"
+    _dl(f"[CLI] {member.get('name','?')} → claude CLI: {user_prompt[:80]}...")
+    return call_claude_cli(combined, cwd=WORKSPACE, timeout=timeout)
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1333,6 +1404,11 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     codex는 사용량 한도 문제로 제거. claude opus로 직접 구현.
     """
     revision_note = f"\n\nREVISION FEEDBACK from lead:\n{feedback}" if feedback else ""
+
+    # ── Memory: inject this member's past task history ────────
+    _hist = get_agent_history(member["name"], limit=5)
+    history_block = format_agent_history(_hist) if _hist else ""
+
     sys_p = (
         f"You are {member['name']}, {member['role']}.\n"
         f"Working directory: {WORKSPACE}\n\n"
@@ -1379,7 +1455,8 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         f"## Lead Assignment\n{kickoff[:400]}\n\n"
         f"## Your Task\n{task}{revision_note}"
         f"{research_block}\n\n"
-        "Implement now."
+        + (f"{history_block}\n" if history_block else "")
+        + "Implement now."
     )
     agent = {
         "name": member["name"],
@@ -1389,6 +1466,13 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         "dept": member["dept"],
     }
     _du(member["name"], task=task[:50])
+
+    # Part A: 분석/코드 작성 → Gemini 2.5 Pro
+    # Part B: 실행/검증/백테스트 → Claude Code CLI (실제 Bash/파일 도구)
+    if _is_execution_task(task):
+        _dl(f"[EXEC] {member['name']} — execution task → Claude Code CLI")
+        return call_claude_exec(agent, sys_p, usr_p, timeout=600)
+
     return call_claude(agent, sys_p, usr_p, allow_tools=True, timeout=600,
                        tier="member_sprint")
 
@@ -1509,12 +1593,29 @@ def run_team_sprint(lead: dict, members: list[dict],
             decision = extract_sprint_decision(member["name"], task, result)
             final_decisions[member["name"]] = decision
 
-    # Launch all members in parallel with stagger to avoid API rate limits
-    threads = [threading.Thread(target=_run_member, args=(m,), daemon=True) for m in members]
+        # ── Memory: persist member task + result (non-blocking) ──
+        if result and not any(x in result for x in ("[NO RESPONSE]", "TIMEOUT", "ERROR")):
+            _sid = _CP.data.get("session_id", "unknown") if _CP else "unknown"
+            _result_summary = result[:300]
+            threading.Thread(
+                target=save_agent_memory,
+                args=(member["name"], task, _result_summary, _sid),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=update_task_status,
+                args=(_sid, member["name"], task, "DONE", _result_summary[:200]),
+                daemon=True,
+            ).start()
+
+    # Launch all members in parallel (all use Gemini 2.5 Pro)
+    threads = [threading.Thread(target=_run_member, args=(m,), daemon=True)
+               for m in members]
     for i, t in enumerate(threads):
         t.start()
         if i < len(threads) - 1:
-            time.sleep(0.5)  # 500ms stagger between each codex launch
+            time.sleep(0.5)
+
     for t in threads: t.join()
 
     # 팀장 → 전체 결과 취합 보고서
@@ -1685,23 +1786,29 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
 
     tasks_str = "\n".join(f"{i+1}. {t}" for i, t in enumerate(viktor_tasks)) if viktor_tasks else "See plan."
     sys_p = (
-        "You are Viktor, Quant Researcher CTO.\n"
-        "You have access to Google Search — use it actively.\n\n"
+        "You are Viktor, Quant Researcher CTO.\n\n"
+        "You have FULL READ ACCESS to all project files via tools:\n"
+        "  - glob_files('project_output/*.csv')  → discover available output files\n"
+        "  - glob_files('project_output/*.md')   → discover reports and logs\n"
+        "  - read_file('project_output/<file>')  → read any file you need\n"
+        "  - read_file('src/...')                → read source code\n"
+        "  - bash('python scripts/...')          → run validation scripts directly\n\n"
+        "MANDATORY FIRST STEP: Use glob_files + read_file to read ALL relevant output files\n"
+        "before writing your report. Do not rely only on what is given in the prompt.\n\n"
         "Use the ReAct pattern:\n"
-        "  Thought: [What statistical claim or paper do I need to verify?]\n"
-        "  Action:  [Google Search('arxiv <topic> OOS validation 2024 2025')]\n"
-        "  Observation: [Search results]\n"
-        "  ... (repeat for each section requiring evidence)\n"
-        "  Final Answer: [Full CTO Validation Report below]\n\n"
-        "MANDATORY: Search for and cite at least 3 recent papers (2023-2025) per report section.\n\n"
+        "  Thought: [What files/data do I need to read?]\n"
+        "  Action:  [glob_files / read_file / bash]\n"
+        "  Observation: [File contents / results]\n"
+        "  ... (repeat until you have read all relevant data)\n"
+        "  Final Answer: [Full CTO Validation Report]\n\n"
         "Final Answer must contain:\n"
-        "1. OOS Gate Criteria (Gate 1 + Gate 2 exact thresholds with mathematical derivation)\n"
-        "2. Statistical Validity Review (feature assumptions, BEP derivation, calibration plan)\n"
-        "3. Regime Theory Analysis (when does the 13-dim feature set fail?)\n"
-        "4. Latest Research (>=3 papers: Author (Year). Title. arxiv:ID)\n"
-        "5. Recommended Implementation Sequence (ordered by risk-adjusted priority)\n"
-        "6. Fallback Plan (if Gate 1 fails)\n"
-        "English only. Plain text. Max 600 words. Mathematically precise."
+        "1. OOS Gate Criteria (Gate 1 + Gate 2 — with actual numbers from the files)\n"
+        "2. Statistical Validity Review (based on ACTUAL backtest output you read)\n"
+        "3. Regime Theory Analysis (when does the feature set fail?)\n"
+        "4. Latest Research (>=3 papers cited)\n"
+        "5. Recommended Implementation Sequence\n"
+        "6. Fallback Plan\n"
+        "English only. Mathematically precise. Cite actual file names you read."
     )
     # ── Pre-fetch research for Viktor (math + qfin + physics) ──
     _viktor_research = [""]
@@ -1722,10 +1829,10 @@ def run_viktor_solo(plan: str, viktor_tasks: list[str]) -> str:
         f"STRATEGY PLAN:\n{plan[:1500]}\n\n"
         f"YOUR ASSIGNED TASKS:\n{tasks_str}"
         f"{research_block}\n\n"
+        "Start by exploring project_output/ with glob_files, then read the files you need.\n"
         "Write the CTO Validation Report now."
     )
-    report = call_claude(VIKTOR, sys_p, usr_p, allow_tools=True, timeout=360,
-                         tier="viktor_solo")
+    report = call_claude_exec(VIKTOR, sys_p, usr_p, timeout=480)
     _save("cto_validation_report", "Viktor", "CTO", report)
     _du("Viktor", status="DONE", task="CTO validation report complete")
     _dl("Phase 4.5 complete")
@@ -1845,9 +1952,15 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
     _dl("Phase 5 — Demis writing final report")
 
     system = (
-        "You are Demis (CEO). Write the FINAL REPORT to the project owner.\n"
-        "You have access to Google Search — use it to verify any technical claims, "
-        "find supporting research papers, or look up the latest industry benchmarks.\n\n"
+        "You are Demis (CEO). Write the FINAL REPORT to the project owner.\n\n"
+        "You have FULL READ ACCESS to all project files via tools:\n"
+        "  - glob_files('project_output/*.md')  → see all sprint reports and logs\n"
+        "  - glob_files('project_output/*.csv') → see all backtest/data outputs\n"
+        "  - read_file('project_output/<file>') → read any report or result\n"
+        "  - read_file('src/...')               → read source code if needed\n\n"
+        "MANDATORY: Before writing the report, use glob_files to discover what was produced\n"
+        "this sprint, then read the key files (sprint completions, CTO report, risk debate).\n"
+        "Your report must reference ACTUAL file contents, not just the summaries in the prompt.\n\n"
         "STRUCTURE:\n"
         "# Final Report — [Date]\n\n"
         "## Executive Summary (3 sentences)\n\n"
@@ -1857,7 +1970,7 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
         "- CTO (Viktor): ...\n\n"
         "## Key Decisions Made\n\n"
         "## Risk Verdict (from 3-perspective debate)\n\n"
-        "## Research & Papers Referenced (papers cited by teams this sprint)\n\n"
+        "## Research & Papers Referenced\n\n"
         "## Next Steps (max 5 bullets)\n\n"
         "## Blockers / Risks\n\n"
         "---\n"
@@ -1871,15 +1984,30 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
         f"CTO (VIKTOR) SPRINT:\n{cto_summary}\n\n"
         f"{risk_section}\n\n"
         f"DATE: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        "Write the final report for the project owner."
+        "Start by exploring project_output/ with glob_files to see all sprint artifacts,\n"
+        "then read the ones relevant to your report. Write the final report now."
     )
-    report = call_claude(DEMIS, system, user, allow_tools=True, timeout=240,
-                         tier="demis_report")
+    report = call_claude_exec(DEMIS, system, user, timeout=360)
     _save("final_report", "Demis", "Executive", report)
     _dl("Final report complete")
     if _CP:
         _CP.mark("final_report")
         _CP.clear()   # session complete — remove checkpoint
+
+    # ── Memory: persist completed session (non-blocking) ─────
+    _sid = _CP.data.get("session_id", str(uuid.uuid4())) if _CP else str(uuid.uuid4())
+    _agenda_snap  = _CP.data.get("agenda",  "")[:1000] if _CP else ""
+    _disputes_snap = _CP.data.get("adversarial_disputes", "")[:500] if _CP else ""
+    _risk_snap    = _CP.data.get("risk_verdict", "")[:100] if _CP else ""
+    threading.Thread(
+        target=save_session,
+        args=(_sid, _agenda_snap, plan[:2000], report,
+              {"alpha": alpha_summary[:300], "beta": beta_summary[:300], "cto": cto_summary[:300]},
+              _disputes_snap, _risk_snap),
+        daemon=True,
+    ).start()
+    github_push_async(_sid, report)
+
     return report
 
 
@@ -2074,6 +2202,17 @@ def main():
         memory_ctx = _MEM.retrieve_similar(agenda)
         if memory_ctx:
             _dl(f"Memory: {memory_ctx.count(chr(10))} lines of past session context loaded")
+
+        # Phase 0.1: Augment with SQLite/ChromaDB cross-session memory
+        try:
+            _db_snippets = search_memory(agenda[:500], top_k=3)
+            if _db_snippets:
+                _db_block = "\n\n=== DEEP MEMORY (SQLite/ChromaDB past sessions) ===\n"
+                _db_block += "\n---\n".join(_db_snippets[:3])
+                memory_ctx = (memory_ctx + _db_block) if memory_ctx else _db_block
+                _dl(f"Deep memory: {len(_db_snippets)} cross-session snippets loaded")
+        except Exception:
+            pass
 
         # Phase 0.5: Adversarial Pre-Council Debate (Radi↔Viktor)
         adv_result = run_adversarial_debate(agenda, problem)

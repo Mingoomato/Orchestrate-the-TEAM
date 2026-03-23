@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+# Load .env before anything else
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)
+except ImportError:
+    pass
+
 """
 Orchestration System v5 — Quantum Trading Council (TradingAgents-Enhanced)
 
@@ -257,6 +264,24 @@ def _sigint_handler(_sig, _frame):
     if _CP:
         _CP.save()
         print(f"  [Checkpoint saved → {CHECKPOINT_FILE}]")
+        # Sync GitHub push (not daemon — must complete before exit)
+        try:
+            import os as _os
+            from github import Github as _Github
+            _token = _os.environ.get("GITHUB_MEMORY_TOKEN")
+            _repo_name = _os.environ.get("GITHUB_MEMORY_REPO")
+            if _token and _repo_name:
+                from datetime import datetime as _dt
+                _sid = _CP.data.get("session_id", "interrupted")
+                _content = f"[INTERRUPTED — partial session]\n\n{json.dumps(_CP.data, ensure_ascii=False, indent=2)}"
+                _g = _Github(_token)
+                _repo = _g.get_repo(_repo_name)
+                _date = _dt.now().strftime("%Y-%m-%d_%H%M")
+                _path = f"memory/sessions/{_date}_{_sid[:8]}_interrupted.md"
+                _repo.create_file(_path, f"interrupted: {_sid[:8]}", _content.encode("utf-8"))
+                print(f"  [GitHub push → {_path}]")
+        except Exception as _e:
+            print(f"  [GitHub push failed: {_e}]")
         print("  [Resume with: python orchestrate.py → r]")
     sys.exit(0)
 

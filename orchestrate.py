@@ -757,8 +757,18 @@ def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
     except FileNotFoundError:
         # claude CLI not installed → fallback to Gemini directly
         _dl("[CLI→GEMINI] claude CLI not found — falling back to gemini-2.5-pro")
+        # Strip tool-call instructions so Gemini doesn't hallucinate glob_files/read_file
+        _TOOL_PHRASES = (
+            "glob_files(", "read_file(", "bash(", "MANDATORY FIRST STEP",
+            "Start by exploring project_output/ with glob_files",
+            "You have FULL READ ACCESS to all project files via tools",
+        )
+        clean_prompt = "\n".join(
+            line for line in prompt.splitlines()
+            if not any(p in line for p in _TOOL_PHRASES)
+        )
         return call_gemini(
-            {"name": "CLI-fallback"}, prompt, MODEL_OPUS, timeout, allow_search=False
+            {"name": "CLI-fallback"}, clean_prompt, MODEL_OPUS, timeout, allow_search=False
         )
     except Exception as e:
         return f"[ERROR: {e}]"

@@ -1661,8 +1661,7 @@ def _lead_assign_tasks(lead: dict, members: list[dict], plan: str, lead_tasks: l
 
 def _member_implement(member: dict, task: str, plan: str, kickoff: str,
                       feedback: str = "") -> str:
-    """팀원 → claude -p (allow_tools=True) 구현.
-    codex는 사용량 한도 문제로 제거. claude opus로 직접 구현.
+    """팀원 → Gemini-2.5-pro ReAct loop 구현.
     """
     revision_note = f"\n\nREVISION FEEDBACK from lead:\n{feedback}" if feedback else ""
 
@@ -1731,7 +1730,7 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     # Part A: 분석/코드 작성 → Gemini 2.5 Pro (ReAct loop for file access)
     # Part B: 실행/검증/백테스트 → Claude Code CLI (실제 Bash/파일 도구)
     if _is_execution_task(task):
-        _dl(f"[EXEC] {member['name']} — execution task → Claude Code CLI")
+        _dl(f"[EXEC] {member['name']} — execution task → Gemini-2.5-pro ReAct")
         return call_claude_exec(agent, sys_p, usr_p, timeout=600)
 
     # ReAct loop: model can Read/Write/Bash files iteratively

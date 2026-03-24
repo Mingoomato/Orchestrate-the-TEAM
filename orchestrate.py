@@ -665,6 +665,36 @@ def _create_receipt(tool_name: str, inputs: str, output: str) -> str:
     return rid
 
 
+def _verify_sprint_files(final_decisions: dict) -> dict[str, list[str]]:
+    """Layer 1 & 2: 각 멤버가 보고한 files_changed가 실제 디스크에 존재하는지 확인.
+    Returns {member_name: [missing_file, ...]}
+    """
+    missing: dict[str, list[str]] = {}
+    for member_name, decision in final_decisions.items():
+        files = decision.get("files_changed", [])
+        not_found = []
+        for f in files:
+            if not f or f == "-":
+                continue
+            p = Path(f) if Path(f).is_absolute() else WORKSPACE / f
+            if not p.exists():
+                not_found.append(f)
+        if not_found:
+            missing[member_name] = not_found
+    return missing
+
+
+def _extract_files_from_summary(text: str) -> list[str]:
+    """CEO Layer 2: 보고서 텍스트에서 파일 경로 패턴 추출."""
+    # src/..., scripts/..., tests/..., docs/..., project_output/... 패턴
+    patterns = re.findall(
+        r'(?:src|scripts|tests|docs|project_output|configs|data|reports)'
+        r'[/\\][\w/\\.\-]+\.(?:py|yaml|yml|md|csv|json|npz|pt)',
+        text
+    )
+    return list(set(patterns))
+
+
 def _verify_final_report(text: str) -> list[str]:
     """Check if report cites receipt IDs that don't exist in RECEIPT_STORE.
     Returns list of hallucination warnings."""
@@ -1852,6 +1882,33 @@ def run_team_sprint(lead: dict, members: list[dict],
 
     for t in threads: t.join()
 
+    # ── Layer 1: 팀장 파일 존재 검증 + 재지시 ──────────────────────────────
+    missing_by_member = _verify_sprint_files(final_decisions)
+    if missing_by_member:
+        _dl(f"[VERIFY L1] {len(missing_by_member)} members have missing files — retrying")
+        for m_name, missing_files in missing_by_member.items():
+            member = next((m for m in members if m["name"] == m_name), None)
+            if not member:
+                continue
+            _dl(f"[VERIFY L1] {m_name}: missing {missing_files} — forcing retry")
+            orig_task = assignments.get(m_name, "Implement assigned task.")
+            retry_task = (
+                orig_task
+                + f"\n\nCRITICAL — 팀장 검증 실패: 다음 파일이 디스크에 존재하지 않음: {missing_files}\n"
+                + "반드시 Write() 액션을 사용하여 해당 파일을 실제로 생성하라. 설명만 하면 안 됨."
+            )
+            retry_result = _member_implement(
+                member, retry_task, plan, kickoff,
+                feedback=f"[팀장 지시] 파일이 실제로 생성되지 않았음: {missing_files}. Write() 액션으로 즉시 생성할 것."
+            )
+            if retry_result and not any(x in retry_result for x in ("[NO RESPONSE]", "TIMEOUT", "ERROR")):
+                final_results[m_name] = retry_result
+                final_decisions[m_name] = extract_sprint_decision(m_name, orig_task, retry_result)
+                _save(f"{m_name.lower()}_verify_retry", m_name, lead["dept"], retry_result)
+                _dl(f"[VERIFY L1] {m_name} retry complete")
+    else:
+        _dl("[VERIFY L1] All claimed files exist on disk ✓")
+
     # 팀장 → 전체 결과 취합 보고서
     sprint_log = "\n\n".join(
         f"[{m['name']}]\n{final_results.get(m['name'],'[NO RESULT]')}"
@@ -2171,6 +2228,26 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
         "Start by exploring project_output/ with glob_files to see all sprint artifacts,\n"
         "then read the ones relevant to your report. Write the final report now."
     )
+    # ── Layer 2: CEO 파일 존재 2중 검증 ────────────────────────────────────
+    all_summaries = f"{alpha_summary}\n{beta_summary}\n{cto_summary}"
+    claimed_files = _extract_files_from_summary(all_summaries)
+    ceo_missing = [f for f in claimed_files
+                   if not (Path(f) if Path(f).is_absolute() else WORKSPACE / f).exists()]
+    if ceo_missing:
+        _dl(f"[VERIFY L2] CEO: {len(ceo_missing)} files missing from summaries: {ceo_missing}")
+        # Demis → 팀장에게 재지시 프롬프트를 user에 주입
+        user += (
+            f"\n\n[CEO 2중 검증 실패]\n"
+            f"다음 파일이 보고서에는 언급됐으나 실제 디스크에 존재하지 않음:\n"
+            + "\n".join(f"  - {f}" for f in ceo_missing)
+            + "\n\n이 파일들에 대한 내용을 보고서에 포함하지 말 것. "
+            + "해당 항목은 'UNVERIFIED (file not found)'로 표기할 것. "
+            + "팀장에게 해당 파일 생성을 재지시하는 내용을 Blockers 섹션에 명시할 것."
+        )
+        _dl("[VERIFY L2] CEO injecting missing-file notice into final report prompt")
+    else:
+        _dl("[VERIFY L2] CEO: all summary files verified on disk ✓")
+
     report = call_claude_exec(DEMIS, system, user, timeout=360)
     _save("final_report", "Demis", "Executive", report)
     _dl("Final report complete")

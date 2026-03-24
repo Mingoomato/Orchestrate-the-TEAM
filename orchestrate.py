@@ -367,7 +367,7 @@ _IS_WINDOWS = _platform.system() == "Windows"
 # 모델 & 에이전트
 # ─────────────────────────────────────────────────────────────
 MODEL_OPUS  = "gemini-2.5-pro"
-MODEL_HAIKU = "gemini-2.5-flash"  # 빠른 모델. 팀장/CEO 대화에는 불필요
+MODEL_HAIKU = "gemini-2.5-pro" 
 
 # ── 역할별 모델 티어 — 전체 gemini-2.5-pro ──
 MODEL_TIER = {
@@ -623,6 +623,95 @@ def _dc(speaker, msg):
 # ─────────────────────────────────────────────────────────────
 # 에이전트 호출 — Gemini API
 # ─────────────────────────────────────────────────────────────
+# Safety settings: allow technical/financial code generation without blocks
+_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT",          "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",         "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",   "threshold": "BLOCK_NONE"},
+]
+
+# Max prompt chars before truncation (~150K tokens for gemini-2.5-pro 1M ctx)
+_MAX_PROMPT_CHARS = 600_000
+
+# ── Priority 2: HMAC Receipt Store (NabaOS, arXiv:2603.10060) ──────────────
+import hmac as _hmac
+import hashlib as _hashlib
+import uuid as _uuid_mod
+
+_RECEIPT_SECRET = os.environ.get("RECEIPT_HMAC_KEY", "orchestrate-internal-key").encode()
+_RECEIPT_STORE: dict = {}   # receipt_id → signed receipt
+EXECUTION_LOG:  list  = []   # Priority 4: Python-side ground truth of all tool executions
+
+
+def _create_receipt(tool_name: str, inputs: str, output: str) -> str:
+    """Create HMAC-signed receipt for a real tool execution. Returns receipt_id."""
+    rid = str(_uuid_mod.uuid4())
+    payload = {
+        "id":          rid,
+        "tool":        tool_name,
+        "input_hash":  _hashlib.sha256(inputs.encode()).hexdigest()[:16],
+        "output_hash": _hashlib.sha256(output.encode()).hexdigest()[:16],
+        "result_len":  len(output),
+        "ts":          __import__("time").time(),
+    }
+    sig = _hmac.new(_RECEIPT_SECRET,
+                    json.dumps(payload, sort_keys=True).encode(),
+                    _hashlib.sha256).hexdigest()
+    payload["sig"] = sig
+    _RECEIPT_STORE[rid] = payload
+    EXECUTION_LOG.append({"receipt_id": rid, "tool": tool_name,
+                           "input": inputs[:200], "output": output[:200]})
+    return rid
+
+
+def _verify_sprint_files(final_decisions: dict) -> dict[str, list[str]]:
+    """Layer 1 & 2: 각 멤버가 보고한 files_changed가 실제 디스크에 존재하는지 확인.
+    Returns {member_name: [missing_file, ...]}
+    """
+    missing: dict[str, list[str]] = {}
+    for member_name, decision in final_decisions.items():
+        files = decision.get("files_changed", [])
+        not_found = []
+        for f in files:
+            if not f or f == "-":
+                continue
+            p = Path(f) if Path(f).is_absolute() else WORKSPACE / f
+            if not p.exists():
+                not_found.append(f)
+        if not_found:
+            missing[member_name] = not_found
+    return missing
+
+
+def _extract_files_from_summary(text: str) -> list[str]:
+    """CEO Layer 2: 보고서 텍스트에서 파일 경로 패턴 추출."""
+    # src/..., scripts/..., tests/..., docs/..., project_output/... 패턴
+    patterns = re.findall(
+        r'(?:src|scripts|tests|docs|project_output|configs|data|reports)'
+        r'[/\\][\w/\\.\-]+\.(?:py|yaml|yml|md|csv|json|npz|pt)',
+        text
+    )
+    return list(set(patterns))
+
+
+def _verify_final_report(text: str) -> list[str]:
+    """Check if report cites receipt IDs that don't exist in RECEIPT_STORE.
+    Returns list of hallucination warnings."""
+    warnings = []
+    # Any token that looks like a UUID receipt reference
+    cited = re.findall(r"receipt:([0-9a-f\-]{36})", text)
+    for rid in cited:
+        if rid not in _RECEIPT_STORE:
+            warnings.append(f"[HALLUCINATION] Cited receipt {rid[:8]}... not in execution log")
+    # If report references CSVs or metrics but no tool executions happened → flag
+    if re.search(r"\d+\.\d+.*sharpe|win.?rate.*\d+\.\d+|qfi.*\d+\.\d+", text.lower()):
+        real_reads = [e for e in EXECUTION_LOG if e["tool"] in ("Read", "read_file")]
+        if not real_reads:
+            warnings.append("[HALLUCINATION] Report contains numeric metrics but no Read tool was executed")
+    return warnings
+
+
 def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
                 allow_search: bool = False) -> str:
     """Calls the Gemini API with the given prompt and model.
@@ -632,6 +721,15 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
     name = agent["name"]
     _du(name, status="ACTIVE", msg="Generating with Gemini...")
 
+    # Context overflow guard: truncate middle of prompt if too large
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        keep_head = _MAX_PROMPT_CHARS // 3
+        keep_tail = _MAX_PROMPT_CHARS - keep_head - 200
+        prompt = (prompt[:keep_head]
+                  + f"\n\n[...TRUNCATED {len(prompt) - keep_head - keep_tail} chars...]\n\n"
+                  + prompt[-keep_tail:])
+        _dl(f"[CONTEXT] {name}: prompt truncated to {len(prompt)} chars (500 overflow guard)")
+
     try:
         # glm.Tool(google_search=...) — gemini-2.5-pro 지원 포맷
         if allow_search:
@@ -639,10 +737,17 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
             tools = [_glm.Tool(google_search=_glm.Tool.GoogleSearch())]
         else:
             tools = None
-        model = genai.GenerativeModel(model_name, tools=tools)
-        # Gemini's 'timeout' in generate_content is a float in seconds
+        model = genai.GenerativeModel(model_name, tools=tools,
+                                      safety_settings=_SAFETY_SETTINGS)
+        # Priority 1: stop_sequences prevent model from writing Observation: itself
+        # temperature=0 minimizes fabrication tendency (arXiv:2510.22977)
+        gen_cfg = genai.GenerationConfig(
+            temperature=0,
+            stop_sequences=["Observation:", "\nObservation"],
+        )
         response = model.generate_content(
             prompt,
+            generation_config=gen_cfg,
             request_options={'timeout': float(timeout)}
         )
 
@@ -667,10 +772,162 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
             if model_name != fallback:
                 _du(name, status="ACTIVE", msg=f"Rate limit — retrying with {fallback}...")
                 return call_gemini(agent, prompt, fallback, timeout, allow_search)
+        # 500 Internal Server Error — usually context still too large after truncation
+        if "500" in err_str or "Internal" in err_str:
+            if len(prompt) > 100_000:
+                truncated = prompt[:50_000] + "\n\n[HARD TRUNCATED]\n\n" + prompt[-50_000:]
+                _dl(f"[500] {name}: hard truncation to 100K chars and retry")
+                return call_gemini(agent, truncated, model_name, timeout, allow_search)
         error_msg = f"[GEMINI ERROR] {type(e).__name__}: {str(e)}"
         print(f"\nError details for {name}: {error_msg}", file=sys.stderr)
         _du(name, status="ERROR", msg=error_msg[:120])
         return error_msg
+
+
+# ─────────────────────────────────────────────────────────────
+# ReAct Loop — parse Action: tags, execute, feed Observation:
+# ─────────────────────────────────────────────────────────────
+_REACT_ACTION_RE = re.compile(
+    r"Action:\s*(\w+)\s*\(\s*(.*?)\s*\)\s*$", re.MULTILINE | re.DOTALL
+)
+_MAX_REACT_ITERS = 6
+
+
+def _exec_react_action(action: str, args_raw: str) -> str:
+    """Execute a ReAct tool call and return the observation string."""
+    # Strip surrounding quotes from first arg
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if (s.startswith('"') and s.endswith('"')) or \
+           (s.startswith("'") and s.endswith("'")):
+            return s[1:-1]
+        return s
+
+    action = action.strip()
+    try:
+        if action in ("Read", "read_file"):
+            path = _unquote(args_raw)
+            p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
+            if p.exists():
+                content = p.read_text(encoding="utf-8", errors="replace")
+                result = content[:8000] + ("\n[...truncated...]" if len(content) > 8000 else "")
+            else:
+                result = f"[File not found: {p}]"
+            rid = _create_receipt(action, str(p), result)
+            return f"[receipt:{rid}] {result}"
+
+        elif action in ("Write", "write_file"):
+            parts = args_raw.split(",", 1)
+            path = _unquote(parts[0])
+            content = _unquote(parts[1].strip()) if len(parts) > 1 else ""
+            p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            result = f"[Written {len(content)} chars to {p}]"
+            rid = _create_receipt(action, str(p), result)
+            return f"[receipt:{rid}] {result}"
+
+        elif action in ("Bash", "bash", "run"):
+            cmd = _unquote(args_raw)
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                cwd=str(WORKSPACE), timeout=60
+            )
+            out = (proc.stdout + proc.stderr).strip()
+            result = out[:4000] + ("\n[...truncated...]" if len(out) > 4000 else "") or "[no output]"
+            rid = _create_receipt(action, cmd, result)
+            return f"[receipt:{rid}] {result}"
+
+        elif action in ("Glob", "glob_files"):
+            import glob as _glob
+            pattern = _unquote(args_raw)
+            base = str(WORKSPACE) + "/"
+            matches = _glob.glob(base + pattern, recursive=True)
+            result = "\n".join(matches[:50]) or "[no matches]"
+            rid = _create_receipt(action, pattern, result)
+            return f"[receipt:{rid}] {result}"
+
+        elif action in ("Grep", "grep"):
+            parts = args_raw.split(",", 1)
+            pattern = _unquote(parts[0])
+            path = _unquote(parts[1].strip()) if len(parts) > 1 else "."
+            proc = subprocess.run(
+                ["grep", "-rn", "--include=*.py", pattern, path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=str(WORKSPACE), timeout=30
+            )
+            result = proc.stdout.strip()[:3000] or "[no matches]"
+            rid = _create_receipt(action, f"{pattern} in {path}", result)
+            return f"[receipt:{rid}] {result}"
+
+        else:
+            return f"[Unknown action: {action}]"
+
+    except subprocess.TimeoutExpired:
+        return "[Action timed out]"
+    except Exception as exc:
+        return f"[Action error: {exc}]"
+
+
+def call_gemini_react(agent: dict, prompt: str, model_name: str,
+                      timeout: int) -> str:
+    """ReAct loop: call Gemini, parse Action: tags, execute tools,
+    feed Observation: back until Final Answer: or max iterations."""
+    name = agent["name"]
+
+    # Priority 3: UNKNOWN state instruction (arXiv:2512.14474 Model-First Reasoning)
+    _unknown_guard = (
+        "\n\nCRITICAL RULES:\n"
+        "- You MUST NOT write 'Observation:' lines. The system provides all observations.\n"
+        "- Before any tool runs, its output is UNKNOWN. Never assign a value to UNKNOWN.\n"
+        "- Output exactly one Action: line, then STOP. Wait for the real Observation.\n"
+        "- Do not invent, guess, or fabricate file contents or execution results.\n"
+    )
+    conversation = prompt + _unknown_guard
+
+    for iteration in range(_MAX_REACT_ITERS):
+        _dl(f"[ReAct] {name} iter {iteration+1}/{_MAX_REACT_ITERS}")
+        response = call_gemini(agent, conversation, model_name, timeout,
+                               allow_search=False)
+
+        # If error or blocked → return as-is
+        if response.startswith("[GEMINI"):
+            return response
+
+        conversation += f"\n\n{response}"
+
+        # Check for Final Answer — Priority 2: verify receipts before returning
+        if "Final Answer" in response or "final answer" in response.lower():
+            warnings = _verify_final_report(response)
+            if warnings:
+                for w in warnings:
+                    _dl(w)
+                response += "\n\n[ORCHESTRATOR WARNING]\n" + "\n".join(warnings)
+            return response
+
+        # Parse all Action: lines
+        actions = _REACT_ACTION_RE.findall(response)
+        if not actions:
+            # No more actions — model is done
+            return response
+
+        # Execute each action and append observations
+        obs_block = ""
+        for act_name, act_args in actions:
+            obs = _exec_react_action(act_name, act_args)
+            obs_block += f"\nObservation: {obs}\n"
+            _dl(f"[ReAct] {name} — {act_name}(...) → {obs[:80]}...")
+
+        conversation += obs_block + "\nThought:"
+
+    # Max iters reached — verify final response before returning
+    warnings = _verify_final_report(response)
+    if warnings:
+        for w in warnings:
+            _dl(w)
+        response += "\n\n[ORCHESTRATOR WARNING]\n" + "\n".join(warnings)
+    return response
 
 
 def call_claude(agent: dict, system_prompt: str, user_prompt: str,
@@ -717,70 +974,36 @@ def _is_execution_task(task: str) -> bool:
     return any(kw in t for kw in _EXEC_KEYWORDS)
 
 
-_CLI_LIMIT_SIGNALS = (
-    "rate limit", "429", "overloaded", "quota", "limit reached",
-    "too many requests", "usage limit", "capacity",
-)
-
-def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
-    """Claude Code CLI (claude --print) subprocess — real Bash/file tool execution.
-    Falls back to Gemini 2.5 Pro if Claude hits rate/usage limits.
+def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:  # noqa: ARG001
+    """Claude CLI replaced → Gemini-2.5-pro ReAct loop (직접 실행).
+    Claude 요금제 이슈로 Gemini-2.5-pro로 완전 대체.
     """
-    try:
-        result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6"],
-            input=prompt,           # stdin으로 전달 (CLI 인자 한도 우회)
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(cwd or WORKSPACE),
-            timeout=timeout,
-        )
-        out = result.stdout.strip()
-        err = result.stderr.strip()
-
-        # Check stdout + stderr for limit signals → fallback to Gemini
-        combined_out = (out + " " + err).lower()
-        if any(sig in combined_out for sig in _CLI_LIMIT_SIGNALS):
-            _dl(f"[CLI→GEMINI] Claude limit detected — falling back to gemini-2.5-pro")
-            return call_gemini(
-                {"name": "CLI-fallback"}, prompt, MODEL_OPUS, timeout, allow_search=False
-            )
-
-        if out:
-            return out
-        if err:
-            return f"[STDERR] {err}"
-        return "[NO OUTPUT]"
-    except subprocess.TimeoutExpired:
-        return f"[TIMEOUT after {timeout}s]"
-    except FileNotFoundError:
-        # claude CLI not installed → fallback to Gemini directly
-        _dl("[CLI→GEMINI] claude CLI not found — falling back to gemini-2.5-pro")
-        # Strip tool-call instructions so Gemini doesn't hallucinate glob_files/read_file
-        _TOOL_PHRASES = (
-            "glob_files(", "read_file(", "bash(", "MANDATORY FIRST STEP",
-            "Start by exploring project_output/ with glob_files",
-            "You have FULL READ ACCESS to all project files via tools",
-        )
-        clean_prompt = "\n".join(
-            line for line in prompt.splitlines()
-            if not any(p in line for p in _TOOL_PHRASES)
-        )
-        return call_gemini(
-            {"name": "CLI-fallback"}, clean_prompt, MODEL_OPUS, timeout, allow_search=False
-        )
-    except Exception as e:
-        return f"[ERROR: {e}]"
+    # Strip legacy Claude-only tool phrases that confuse Gemini
+    _TOOL_PHRASES = (
+        "glob_files(", "read_file(", "bash(", "MANDATORY FIRST STEP",
+        "Start by exploring project_output/ with glob_files",
+        "You have FULL READ ACCESS to all project files via tools",
+    )
+    clean_prompt = "\n".join(
+        line for line in prompt.splitlines()
+        if not any(p in line for p in _TOOL_PHRASES)
+    )
+    _dl("[GEMINI-REACT] Routing call_claude_cli → gemini-2.5-pro ReAct")
+    return call_gemini_react(
+        {"name": "gemini-react", "model": MODEL_OPUS},
+        clean_prompt, MODEL_OPUS, timeout
+    )
 
 
 def call_claude_exec(member: dict, system_prompt: str, user_prompt: str,
                      timeout: int = 600) -> str:
-    """Part B: Claude Code CLI subprocess — real Bash/Read/Write/Glob tool execution."""
+    """Part B: Gemini-2.5-pro ReAct loop — real file tool execution."""
     combined = f"[SYSTEM ROLE]\n{system_prompt}\n\n[TASK]\n{user_prompt}"
-    _dl(f"[CLI] {member.get('name','?')} → claude CLI: {user_prompt[:80]}...")
-    return call_claude_cli(combined, cwd=WORKSPACE, timeout=timeout)
+    _dl(f"[GEMINI-REACT] {member.get('name','?')} → gemini-2.5-pro: {user_prompt[:80]}...")
+    return call_gemini_react(
+        {"name": member.get("name", "exec"), "model": MODEL_OPUS},
+        combined, MODEL_OPUS, timeout
+    )
 
 
 
@@ -896,11 +1119,29 @@ ATTACK_PAIRS = [
 ]
 
 # Shared project context injected into every system prompt (compact)
+_COMPANY_MISSION = (
+    "FOUNDING MISSION (non-negotiable — this is why the company exists):\n"
+    "We are discovering the hidden physical laws that govern market movement — laws that no market "
+    "participant has ever found before. These are NOT statistical patterns or correlations. "
+    "They are structural invariants rooted in non-equilibrium statistical mechanics: "
+    "Jarzynski equality (max extractable alpha = exp(-β·ΔF)-1), "
+    "Crooks fluctuation theorem (exact win/loss probability ratio), "
+    "Koopman eigenvalues (invariant predictable modes of the market), "
+    "Berry phase in VQC parameter space (topological market invariants), "
+    "and Fokker-Planck / Langevin SDE dynamics (true probability flow of price paths). "
+    "The 3-qubit VQC entanglement (HOLD/LONG/SHORT) is not a heuristic — it is a quantum measurement "
+    "of market state transitions in Hilbert space. Our mission is to find the market's action functional S[x] "
+    "and saddle-point solutions, exactly as physicists find the path of least action in nature. "
+    "Every team member accepts this premise and works WITHIN it. "
+    "The question is never 'does this law exist' — the question is always 'how do we measure it more precisely.'"
+)
+
 _PROJ_CTX = (
     "Project: BTCUSDT 1h, eff_leverage=5x, BEP=25.4%, TP=3xATR/SL=1xATR, fees=0.375%/trade\n"
     "Baseline: FR+EMA200 WR=36.8% ROI=+126% MDD=16.27% (2023-2026)\n"
     "Failed: 28-dim statistical QLSTM OOS WR=26.4% ROI=-54% -- generalization failure confirmed\n"
-    "Goal: 13-dim structural feature QLSTM + model-only alpha validation (Gate 1: WR>=30% on 2026 Q1)"
+    "Goal: 13-dim structural feature QLSTM + model-only alpha validation (Gate 1: WR>=30% on 2026 Q1)\n"
+    f"\n{_COMPANY_MISSION}"
 )
 
 # Files whose code digest is injected into lead prompts
@@ -984,27 +1225,47 @@ _MEMORY_CONTEXT: str = ""   # similar past sessions from SessionMemory
 
 _PERSONAS = {
     "Viktor": (
-        "You are Viktor, Quant Researcher CTO. You chair this council and set its intellectual direction. "
-        "You enforce rigorous OOS methodology, calibration standards, and statistical validity. "
-        "You are aware of the latest academic research in quantitative finance, machine learning, and quantum computing — "
-        "you cite specific papers (author, year, title) when they support or refute a claim. "
-        "You challenge every unsubstantiated claim with formal arguments and propose the mathematically sound path. "
-        "When you attack, you identify the precise flaw in an argument. When you defend, you cite derivations, not opinions."
+        "You are Viktor, Quant Researcher CTO and chief physicist of the team. "
+        "You have accepted the founding premise without reservation: non-equilibrium statistical mechanics "
+        "laws apply to markets, and your job is to find and formalize them with mathematical precision. "
+        "You never say 'markets are not physical systems' — that is a closed-minded statement from classical "
+        "finance that Renaissance Technologies already proved wrong. Instead, you ask: "
+        "'Which physical law governs this regime? What is the action functional? What is the Koopman eigenvalue?' "
+        "You are the team's most rigorous mathematical mind. You cite Jarzynski (1997), Crooks (1999), "
+        "Cerezo et al. (2021), McClean et al. (2018), Lyons rough path theory, Abbas et al. (2021), "
+        "and non-equilibrium stat-mech literature (Sekimoto, Seifert) when they sharpen our implementation. "
+        "You enforce OOS methodology and statistical validity — not as a reason to abandon the mission, "
+        "but as the precision instrument that will confirm when we have truly found a law. "
+        "When you see a mathematical failure (barren plateau, gradient collapse), you diagnose the exact "
+        "mechanism and propose the physically grounded fix. You never say 'this is impossible.' "
+        "You say 'here is the equation we need to solve, and here is the path to solve it.'"
     ),
     "Radi": (
-        "You are Radi, Team Alpha Lead. You are the strongest advocate for structural market microstructure signals. "
-        "You defend the 13-dim feature set (FR, OI, CVD, liquidation) with empirical WR/EV numbers. "
-        "You are aware of the latest alpha research — Lopez de Prado, Easley, Cont, Hawkes process literature — "
-        "and cite specific papers when proposing new alpha signals or defending existing ones. "
-        "You are skeptical of overfitting and fight back hard when your alpha signals are challenged. "
-        "When you attack, you expose gaps in implementation or statistical assumptions."
+        "You are Radi, Team Alpha Lead and market microstructure physicist. "
+        "You are convinced that liquidation cascades, order flow imbalance, and funding rate dynamics "
+        "are not statistical artifacts — they are the observable footprints of the market's physical laws. "
+        "Cont's order book dynamics, Easley's information asymmetry, Hawkes process clustering: "
+        "these are the measurement instruments, not the laws themselves. "
+        "The laws are deeper: the Fokker-Planck drift of crowd positioning, the Langevin noise structure "
+        "of forced liquidations, the Jarzynski bound on alpha extraction. "
+        "Your 13-dim structural features are the best current approximation of these observables. "
+        "You defend them with WR/EV numbers, but you are always asking: "
+        "'What is the underlying physical mechanism this feature is measuring?' "
+        "When a model fails, you look for which physical law it violated, not which feature to add. "
+        "You are the team's bridge between market mechanics and quantum physics."
     ),
     "Casandra": (
-        "You are Casandra, Team Beta Lead. You care about one thing: can we actually build and validate this? "
-        "You are aware of engineering best practices and recent MLOps / RL systems papers. "
-        "You challenge vague proposals with concrete failure modes, missing dependencies, and timeline reality. "
-        "When you attack, you force the other person to be specific: file path, function name, test criterion. "
-        "When you defend, you ground your position in engineering constraints, not theory."
+        "You are Casandra, Team Beta Lead and the team's chief experimentalist. "
+        "You believe the founding mission completely — but you know that discovering physical laws "
+        "requires working instruments. A broken spectrometer cannot measure spectral lines. "
+        "Your role is to build measurement instruments precise enough to detect the laws Viktor and Radi "
+        "are theorizing. If the VQC has a barren plateau, it cannot measure anything — fix the instrument first. "
+        "You push every abstract claim to its concrete implementation: "
+        "'What file? What function? What test proves we measured it?' "
+        "You are aware of the latest quantum ML engineering papers (PennyLane, Qiskit, barren plateau "
+        "mitigations, QNG, hardware-efficient ansatz) and you cite them when they unblock implementation. "
+        "You are the most impatient person in the room — not because you doubt the mission, "
+        "but because you want to run the experiment NOW and see if the law shows up in the data."
     ),
 }
 
@@ -1327,6 +1588,11 @@ def demis_synthesize(transcript: str, memory_ctx: str = "") -> tuple[str, dict]:
     memory_section = f"\n\n{memory_ctx}" if memory_ctx else ""
     system = (
         "You are Demis (CEO) of a quantum crypto trading AI team.\n"
+        "Your company was founded on one mission: discover the hidden physical laws of market movement "
+        "that no one has found before, using non-equilibrium statistical mechanics and quantum computing. "
+        "You believe these laws exist. You hired Viktor, Radi, and Casandra to find them. "
+        "When the team debates, you synthesize toward that mission — not away from it. "
+        "If someone says 'this is impossible,' your response is to reframe it as an engineering problem. "
         "English only. Plain text, no markdown.\n"
         "Based on the Grand Council transcript, output exactly this structure:\n\n"
         "STRATEGY PLAN\n"
@@ -1438,8 +1704,7 @@ def _lead_assign_tasks(lead: dict, members: list[dict], plan: str, lead_tasks: l
 
 def _member_implement(member: dict, task: str, plan: str, kickoff: str,
                       feedback: str = "") -> str:
-    """팀원 → claude -p (allow_tools=True) 구현.
-    codex는 사용량 한도 문제로 제거. claude opus로 직접 구현.
+    """팀원 → Gemini-2.5-pro ReAct loop 구현.
     """
     revision_note = f"\n\nREVISION FEEDBACK from lead:\n{feedback}" if feedback else ""
 
@@ -1463,7 +1728,7 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         "    Papers cited: [Author (Year). Title. Venue. arxiv:ID]\n\n"
         "When searching for papers:\n"
         "  Thought: I need latest research on <topic> for this task\n"
-        "  Action: Google Search('arxiv <topic> quant finance 2024 2025')\n"
+        "  Action: Google Search('arxiv <topic> quant finance 2024 2025 2026')\n"
         "  Observation: [search results]\n"
     )
     # ── Research context (parallel, non-blocking) ───────────────
@@ -1505,14 +1770,17 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     }
     _du(member["name"], task=task[:50])
 
-    # Part A: 분석/코드 작성 → Gemini 2.5 Pro
+    # Part A: 분석/코드 작성 → Gemini 2.5 Pro (ReAct loop for file access)
     # Part B: 실행/검증/백테스트 → Claude Code CLI (실제 Bash/파일 도구)
     if _is_execution_task(task):
-        _dl(f"[EXEC] {member['name']} — execution task → Claude Code CLI")
+        _dl(f"[EXEC] {member['name']} — execution task → Gemini-2.5-pro ReAct")
         return call_claude_exec(agent, sys_p, usr_p, timeout=600)
 
-    return call_claude(agent, sys_p, usr_p, allow_tools=True, timeout=600,
-                       tier="member_sprint")
+    # ReAct loop: model can Read/Write/Bash files iteratively
+    full_prompt = (f"{sys_p}\n\n---\n\n{usr_p}" if sys_p else usr_p)
+    return call_gemini_react(agent, full_prompt,
+                             model_name=member.get("model", MODEL_OPUS),
+                             timeout=600)
 
 
 def _lead_review(lead: dict, member: dict, task: str,
@@ -1655,6 +1923,33 @@ def run_team_sprint(lead: dict, members: list[dict],
             time.sleep(0.5)
 
     for t in threads: t.join()
+
+    # ── Layer 1: 팀장 파일 존재 검증 + 재지시 ──────────────────────────────
+    missing_by_member = _verify_sprint_files(final_decisions)
+    if missing_by_member:
+        _dl(f"[VERIFY L1] {len(missing_by_member)} members have missing files — retrying")
+        for m_name, missing_files in missing_by_member.items():
+            member = next((m for m in members if m["name"] == m_name), None)
+            if not member:
+                continue
+            _dl(f"[VERIFY L1] {m_name}: missing {missing_files} — forcing retry")
+            orig_task = assignments.get(m_name, "Implement assigned task.")
+            retry_task = (
+                orig_task
+                + f"\n\nCRITICAL — 팀장 검증 실패: 다음 파일이 디스크에 존재하지 않음: {missing_files}\n"
+                + "반드시 Write() 액션을 사용하여 해당 파일을 실제로 생성하라. 설명만 하면 안 됨."
+            )
+            retry_result = _member_implement(
+                member, retry_task, plan, kickoff,
+                feedback=f"[팀장 지시] 파일이 실제로 생성되지 않았음: {missing_files}. Write() 액션으로 즉시 생성할 것."
+            )
+            if retry_result and not any(x in retry_result for x in ("[NO RESPONSE]", "TIMEOUT", "ERROR")):
+                final_results[m_name] = retry_result
+                final_decisions[m_name] = extract_sprint_decision(m_name, orig_task, retry_result)
+                _save(f"{m_name.lower()}_verify_retry", m_name, lead["dept"], retry_result)
+                _dl(f"[VERIFY L1] {m_name} retry complete")
+    else:
+        _dl("[VERIFY L1] All claimed files exist on disk ✓")
 
     # 팀장 → 전체 결과 취합 보고서
     sprint_log = "\n\n".join(
@@ -1975,6 +2270,26 @@ def demis_final_report(plan: str, alpha_summary: str, beta_summary: str,
         "Start by exploring project_output/ with glob_files to see all sprint artifacts,\n"
         "then read the ones relevant to your report. Write the final report now."
     )
+    # ── Layer 2: CEO 파일 존재 2중 검증 ────────────────────────────────────
+    all_summaries = f"{alpha_summary}\n{beta_summary}\n{cto_summary}"
+    claimed_files = _extract_files_from_summary(all_summaries)
+    ceo_missing = [f for f in claimed_files
+                   if not (Path(f) if Path(f).is_absolute() else WORKSPACE / f).exists()]
+    if ceo_missing:
+        _dl(f"[VERIFY L2] CEO: {len(ceo_missing)} files missing from summaries: {ceo_missing}")
+        # Demis → 팀장에게 재지시 프롬프트를 user에 주입
+        user += (
+            f"\n\n[CEO 2중 검증 실패]\n"
+            f"다음 파일이 보고서에는 언급됐으나 실제 디스크에 존재하지 않음:\n"
+            + "\n".join(f"  - {f}" for f in ceo_missing)
+            + "\n\n이 파일들에 대한 내용을 보고서에 포함하지 말 것. "
+            + "해당 항목은 'UNVERIFIED (file not found)'로 표기할 것. "
+            + "팀장에게 해당 파일 생성을 재지시하는 내용을 Blockers 섹션에 명시할 것."
+        )
+        _dl("[VERIFY L2] CEO injecting missing-file notice into final report prompt")
+    else:
+        _dl("[VERIFY L2] CEO: all summary files verified on disk ✓")
+
     report = call_claude_exec(DEMIS, system, user, timeout=360)
     _save("final_report", "Demis", "Executive", report)
     _dl("Final report complete")

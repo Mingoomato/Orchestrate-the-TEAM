@@ -367,7 +367,7 @@ _IS_WINDOWS = _platform.system() == "Windows"
 # 모델 & 에이전트
 # ─────────────────────────────────────────────────────────────
 MODEL_OPUS  = "gemini-2.5-pro"
-MODEL_HAIKU = "gemini-2.5-flash"  # 빠른 모델. 팀장/CEO 대화에는 불필요
+MODEL_HAIKU = "gemini-2.5-pro" 
 
 # ── 역할별 모델 티어 — 전체 gemini-2.5-pro ──
 MODEL_TIER = {
@@ -623,6 +623,18 @@ def _dc(speaker, msg):
 # ─────────────────────────────────────────────────────────────
 # 에이전트 호출 — Gemini API
 # ─────────────────────────────────────────────────────────────
+# Safety settings: allow technical/financial code generation without blocks
+_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",  "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT",          "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH",         "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",   "threshold": "BLOCK_NONE"},
+]
+
+# Max prompt chars before truncation (~150K tokens for gemini-2.5-pro 1M ctx)
+_MAX_PROMPT_CHARS = 600_000
+
+
 def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
                 allow_search: bool = False) -> str:
     """Calls the Gemini API with the given prompt and model.
@@ -632,6 +644,15 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
     name = agent["name"]
     _du(name, status="ACTIVE", msg="Generating with Gemini...")
 
+    # Context overflow guard: truncate middle of prompt if too large
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        keep_head = _MAX_PROMPT_CHARS // 3
+        keep_tail = _MAX_PROMPT_CHARS - keep_head - 200
+        prompt = (prompt[:keep_head]
+                  + f"\n\n[...TRUNCATED {len(prompt) - keep_head - keep_tail} chars...]\n\n"
+                  + prompt[-keep_tail:])
+        _dl(f"[CONTEXT] {name}: prompt truncated to {len(prompt)} chars (500 overflow guard)")
+
     try:
         # glm.Tool(google_search=...) — gemini-2.5-pro 지원 포맷
         if allow_search:
@@ -639,7 +660,8 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
             tools = [_glm.Tool(google_search=_glm.Tool.GoogleSearch())]
         else:
             tools = None
-        model = genai.GenerativeModel(model_name, tools=tools)
+        model = genai.GenerativeModel(model_name, tools=tools,
+                                      safety_settings=_SAFETY_SETTINGS)
         # Gemini's 'timeout' in generate_content is a float in seconds
         response = model.generate_content(
             prompt,
@@ -667,10 +689,134 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
             if model_name != fallback:
                 _du(name, status="ACTIVE", msg=f"Rate limit — retrying with {fallback}...")
                 return call_gemini(agent, prompt, fallback, timeout, allow_search)
+        # 500 Internal Server Error — usually context still too large after truncation
+        if "500" in err_str or "Internal" in err_str:
+            if len(prompt) > 100_000:
+                truncated = prompt[:50_000] + "\n\n[HARD TRUNCATED]\n\n" + prompt[-50_000:]
+                _dl(f"[500] {name}: hard truncation to 100K chars and retry")
+                return call_gemini(agent, truncated, model_name, timeout, allow_search)
         error_msg = f"[GEMINI ERROR] {type(e).__name__}: {str(e)}"
         print(f"\nError details for {name}: {error_msg}", file=sys.stderr)
         _du(name, status="ERROR", msg=error_msg[:120])
         return error_msg
+
+
+# ─────────────────────────────────────────────────────────────
+# ReAct Loop — parse Action: tags, execute, feed Observation:
+# ─────────────────────────────────────────────────────────────
+_REACT_ACTION_RE = re.compile(
+    r"Action:\s*(\w+)\s*\(\s*(.*?)\s*\)\s*$", re.MULTILINE | re.DOTALL
+)
+_MAX_REACT_ITERS = 6
+
+
+def _exec_react_action(action: str, args_raw: str) -> str:
+    """Execute a ReAct tool call and return the observation string."""
+    # Strip surrounding quotes from first arg
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if (s.startswith('"') and s.endswith('"')) or \
+           (s.startswith("'") and s.endswith("'")):
+            return s[1:-1]
+        return s
+
+    action = action.strip()
+    try:
+        if action in ("Read", "read_file"):
+            path = _unquote(args_raw)
+            p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
+            if p.exists():
+                content = p.read_text(encoding="utf-8", errors="replace")
+                return content[:8000] + ("\n[...truncated...]" if len(content) > 8000 else "")
+            return f"[File not found: {p}]"
+
+        elif action in ("Write", "write_file"):
+            # args: 'path', 'content'
+            parts = args_raw.split(",", 1)
+            path = _unquote(parts[0])
+            content = _unquote(parts[1].strip()) if len(parts) > 1 else ""
+            p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+            return f"[Written {len(content)} chars to {p}]"
+
+        elif action in ("Bash", "bash", "run"):
+            cmd = _unquote(args_raw)
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                cwd=str(WORKSPACE), timeout=60
+            )
+            out = (result.stdout + result.stderr).strip()
+            return out[:4000] + ("\n[...truncated...]" if len(out) > 4000 else "") or "[no output]"
+
+        elif action in ("Glob", "glob_files"):
+            import glob as _glob
+            pattern = _unquote(args_raw)
+            base = str(WORKSPACE) + "/"
+            matches = _glob.glob(base + pattern, recursive=True)
+            return "\n".join(matches[:50]) or "[no matches]"
+
+        elif action in ("Grep", "grep"):
+            parts = args_raw.split(",", 1)
+            pattern = _unquote(parts[0])
+            path = _unquote(parts[1].strip()) if len(parts) > 1 else "."
+            result = subprocess.run(
+                ["grep", "-rn", "--include=*.py", pattern, path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=str(WORKSPACE), timeout=30
+            )
+            out = result.stdout.strip()
+            return out[:3000] or "[no matches]"
+
+        else:
+            return f"[Unknown action: {action}]"
+
+    except subprocess.TimeoutExpired:
+        return "[Action timed out]"
+    except Exception as exc:
+        return f"[Action error: {exc}]"
+
+
+def call_gemini_react(agent: dict, prompt: str, model_name: str,
+                      timeout: int) -> str:
+    """ReAct loop: call Gemini, parse Action: tags, execute tools,
+    feed Observation: back until Final Answer: or max iterations."""
+    name = agent["name"]
+    conversation = prompt  # grows with each Thought/Action/Observation turn
+
+    for iteration in range(_MAX_REACT_ITERS):
+        _dl(f"[ReAct] {name} iter {iteration+1}/{_MAX_REACT_ITERS}")
+        response = call_gemini(agent, conversation, model_name, timeout,
+                               allow_search=False)
+
+        # If error or blocked → return as-is
+        if response.startswith("[GEMINI"):
+            return response
+
+        conversation += f"\n\n{response}"
+
+        # Check for Final Answer
+        if "Final Answer" in response or "final answer" in response.lower():
+            return response
+
+        # Parse all Action: lines
+        actions = _REACT_ACTION_RE.findall(response)
+        if not actions:
+            # No more actions — model is done
+            return response
+
+        # Execute each action and append observations
+        obs_block = ""
+        for act_name, act_args in actions:
+            obs = _exec_react_action(act_name, act_args)
+            obs_block += f"\nObservation: {obs}\n"
+            _dl(f"[ReAct] {name} — {act_name}(...) → {obs[:80]}...")
+
+        conversation += obs_block + "\nThought:"
+
+    # Max iters reached — return last response
+    return response
 
 
 def call_claude(agent: dict, system_prompt: str, user_prompt: str,
@@ -719,7 +865,7 @@ def _is_execution_task(task: str) -> bool:
 
 _CLI_LIMIT_SIGNALS = (
     "rate limit", "429", "overloaded", "quota", "limit reached",
-    "too many requests", "usage limit", "capacity",
+    "too many requests", "usage limit", "capacity", "you've hit your limit",
 )
 
 def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
@@ -1463,7 +1609,7 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
         "    Papers cited: [Author (Year). Title. Venue. arxiv:ID]\n\n"
         "When searching for papers:\n"
         "  Thought: I need latest research on <topic> for this task\n"
-        "  Action: Google Search('arxiv <topic> quant finance 2024 2025')\n"
+        "  Action: Google Search('arxiv <topic> quant finance 2024 2025 2026')\n"
         "  Observation: [search results]\n"
     )
     # ── Research context (parallel, non-blocking) ───────────────
@@ -1505,14 +1651,17 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     }
     _du(member["name"], task=task[:50])
 
-    # Part A: 분석/코드 작성 → Gemini 2.5 Pro
+    # Part A: 분석/코드 작성 → Gemini 2.5 Pro (ReAct loop for file access)
     # Part B: 실행/검증/백테스트 → Claude Code CLI (실제 Bash/파일 도구)
     if _is_execution_task(task):
         _dl(f"[EXEC] {member['name']} — execution task → Claude Code CLI")
         return call_claude_exec(agent, sys_p, usr_p, timeout=600)
 
-    return call_claude(agent, sys_p, usr_p, allow_tools=True, timeout=600,
-                       tier="member_sprint")
+    # ReAct loop: model can Read/Write/Bash files iteratively
+    full_prompt = (f"{sys_p}\n\n---\n\n{usr_p}" if sys_p else usr_p)
+    return call_gemini_react(agent, full_prompt,
+                             model_name=member.get("model", MODEL_OPUS),
+                             timeout=600)
 
 
 def _lead_review(lead: dict, member: dict, task: str,

@@ -944,70 +944,36 @@ def _is_execution_task(task: str) -> bool:
     return any(kw in t for kw in _EXEC_KEYWORDS)
 
 
-_CLI_LIMIT_SIGNALS = (
-    "rate limit", "429", "overloaded", "quota", "limit reached",
-    "too many requests", "usage limit", "capacity", "you've hit your limit",
-)
-
-def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:
-    """Claude Code CLI (claude --print) subprocess — real Bash/file tool execution.
-    Falls back to Gemini 2.5 Pro if Claude hits rate/usage limits.
+def call_claude_cli(prompt: str, cwd=None, timeout: int = 300) -> str:  # noqa: ARG001
+    """Claude CLI replaced → Gemini-2.5-pro ReAct loop (직접 실행).
+    Claude 요금제 이슈로 Gemini-2.5-pro로 완전 대체.
     """
-    try:
-        result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "--model", "claude-opus-4-6"],
-            input=prompt,           # stdin으로 전달 (CLI 인자 한도 우회)
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(cwd or WORKSPACE),
-            timeout=timeout,
-        )
-        out = result.stdout.strip()
-        err = result.stderr.strip()
-
-        # Check stdout + stderr for limit signals → fallback to Gemini
-        combined_out = (out + " " + err).lower()
-        if any(sig in combined_out for sig in _CLI_LIMIT_SIGNALS):
-            _dl(f"[CLI→GEMINI] Claude limit detected — falling back to gemini-2.5-pro")
-            return call_gemini(
-                {"name": "CLI-fallback"}, prompt, MODEL_OPUS, timeout, allow_search=False
-            )
-
-        if out:
-            return out
-        if err:
-            return f"[STDERR] {err}"
-        return "[NO OUTPUT]"
-    except subprocess.TimeoutExpired:
-        return f"[TIMEOUT after {timeout}s]"
-    except FileNotFoundError:
-        # claude CLI not installed → fallback to Gemini directly
-        _dl("[CLI→GEMINI] claude CLI not found — falling back to gemini-2.5-pro")
-        # Strip tool-call instructions so Gemini doesn't hallucinate glob_files/read_file
-        _TOOL_PHRASES = (
-            "glob_files(", "read_file(", "bash(", "MANDATORY FIRST STEP",
-            "Start by exploring project_output/ with glob_files",
-            "You have FULL READ ACCESS to all project files via tools",
-        )
-        clean_prompt = "\n".join(
-            line for line in prompt.splitlines()
-            if not any(p in line for p in _TOOL_PHRASES)
-        )
-        return call_gemini(
-            {"name": "CLI-fallback"}, clean_prompt, MODEL_OPUS, timeout, allow_search=False
-        )
-    except Exception as e:
-        return f"[ERROR: {e}]"
+    # Strip legacy Claude-only tool phrases that confuse Gemini
+    _TOOL_PHRASES = (
+        "glob_files(", "read_file(", "bash(", "MANDATORY FIRST STEP",
+        "Start by exploring project_output/ with glob_files",
+        "You have FULL READ ACCESS to all project files via tools",
+    )
+    clean_prompt = "\n".join(
+        line for line in prompt.splitlines()
+        if not any(p in line for p in _TOOL_PHRASES)
+    )
+    _dl("[GEMINI-REACT] Routing call_claude_cli → gemini-2.5-pro ReAct")
+    return call_gemini_react(
+        {"name": "gemini-react", "model": MODEL_OPUS},
+        clean_prompt, MODEL_OPUS, timeout
+    )
 
 
 def call_claude_exec(member: dict, system_prompt: str, user_prompt: str,
                      timeout: int = 600) -> str:
-    """Part B: Claude Code CLI subprocess — real Bash/Read/Write/Glob tool execution."""
+    """Part B: Gemini-2.5-pro ReAct loop — real file tool execution."""
     combined = f"[SYSTEM ROLE]\n{system_prompt}\n\n[TASK]\n{user_prompt}"
-    _dl(f"[CLI] {member.get('name','?')} → claude CLI: {user_prompt[:80]}...")
-    return call_claude_cli(combined, cwd=WORKSPACE, timeout=timeout)
+    _dl(f"[GEMINI-REACT] {member.get('name','?')} → gemini-2.5-pro: {user_prompt[:80]}...")
+    return call_gemini_react(
+        {"name": member.get("name", "exec"), "model": MODEL_OPUS},
+        combined, MODEL_OPUS, timeout
+    )
 
 
 

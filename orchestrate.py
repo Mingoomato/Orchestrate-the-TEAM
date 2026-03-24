@@ -885,8 +885,11 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
         "\n\nCRITICAL RULES:\n"
         "- You MUST NOT write 'Observation:' lines. The system provides all observations.\n"
         "- Before any tool runs, its output is UNKNOWN. Never assign a value to UNKNOWN.\n"
-        "- Output exactly one Action: line, then STOP. Wait for the real Observation.\n"
+        "- Output exactly one Action: line per turn, then STOP. Wait for the real Observation.\n"
         "- Do not invent, guess, or fabricate file contents or execution results.\n"
+        "- After receiving enough Observations, write your final response starting with "
+        "'Final Answer:' followed by your complete analysis. Do not keep issuing Actions forever.\n"
+        "- If you have gathered enough information (3 or fewer tool calls), write Final Answer:\n"
     )
     conversation = prompt + _unknown_guard
 

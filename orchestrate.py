@@ -634,6 +634,53 @@ _SAFETY_SETTINGS = [
 # Max prompt chars before truncation (~150K tokens for gemini-2.5-pro 1M ctx)
 _MAX_PROMPT_CHARS = 600_000
 
+# ── Priority 2: HMAC Receipt Store (NabaOS, arXiv:2603.10060) ──────────────
+import hmac as _hmac
+import hashlib as _hashlib
+import uuid as _uuid_mod
+
+_RECEIPT_SECRET = os.environ.get("RECEIPT_HMAC_KEY", "orchestrate-internal-key").encode()
+_RECEIPT_STORE: dict = {}   # receipt_id → signed receipt
+EXECUTION_LOG:  list  = []   # Priority 4: Python-side ground truth of all tool executions
+
+
+def _create_receipt(tool_name: str, inputs: str, output: str) -> str:
+    """Create HMAC-signed receipt for a real tool execution. Returns receipt_id."""
+    rid = str(_uuid_mod.uuid4())
+    payload = {
+        "id":          rid,
+        "tool":        tool_name,
+        "input_hash":  _hashlib.sha256(inputs.encode()).hexdigest()[:16],
+        "output_hash": _hashlib.sha256(output.encode()).hexdigest()[:16],
+        "result_len":  len(output),
+        "ts":          __import__("time").time(),
+    }
+    sig = _hmac.new(_RECEIPT_SECRET,
+                    json.dumps(payload, sort_keys=True).encode(),
+                    _hashlib.sha256).hexdigest()
+    payload["sig"] = sig
+    _RECEIPT_STORE[rid] = payload
+    EXECUTION_LOG.append({"receipt_id": rid, "tool": tool_name,
+                           "input": inputs[:200], "output": output[:200]})
+    return rid
+
+
+def _verify_final_report(text: str) -> list[str]:
+    """Check if report cites receipt IDs that don't exist in RECEIPT_STORE.
+    Returns list of hallucination warnings."""
+    warnings = []
+    # Any token that looks like a UUID receipt reference
+    cited = re.findall(r"receipt:([0-9a-f\-]{36})", text)
+    for rid in cited:
+        if rid not in _RECEIPT_STORE:
+            warnings.append(f"[HALLUCINATION] Cited receipt {rid[:8]}... not in execution log")
+    # If report references CSVs or metrics but no tool executions happened → flag
+    if re.search(r"\d+\.\d+.*sharpe|win.?rate.*\d+\.\d+|qfi.*\d+\.\d+", text.lower()):
+        real_reads = [e for e in EXECUTION_LOG if e["tool"] in ("Read", "read_file")]
+        if not real_reads:
+            warnings.append("[HALLUCINATION] Report contains numeric metrics but no Read tool was executed")
+    return warnings
+
 
 def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
                 allow_search: bool = False) -> str:
@@ -662,9 +709,15 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
             tools = None
         model = genai.GenerativeModel(model_name, tools=tools,
                                       safety_settings=_SAFETY_SETTINGS)
-        # Gemini's 'timeout' in generate_content is a float in seconds
+        # Priority 1: stop_sequences prevent model from writing Observation: itself
+        # temperature=0 minimizes fabrication tendency (arXiv:2510.22977)
+        gen_cfg = genai.GenerationConfig(
+            temperature=0,
+            stop_sequences=["Observation:", "\nObservation"],
+        )
         response = model.generate_content(
             prompt,
+            generation_config=gen_cfg,
             request_options={'timeout': float(timeout)}
         )
 
@@ -727,47 +780,56 @@ def _exec_react_action(action: str, args_raw: str) -> str:
             p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
             if p.exists():
                 content = p.read_text(encoding="utf-8", errors="replace")
-                return content[:8000] + ("\n[...truncated...]" if len(content) > 8000 else "")
-            return f"[File not found: {p}]"
+                result = content[:8000] + ("\n[...truncated...]" if len(content) > 8000 else "")
+            else:
+                result = f"[File not found: {p}]"
+            rid = _create_receipt(action, str(p), result)
+            return f"[receipt:{rid}] {result}"
 
         elif action in ("Write", "write_file"):
-            # args: 'path', 'content'
             parts = args_raw.split(",", 1)
             path = _unquote(parts[0])
             content = _unquote(parts[1].strip()) if len(parts) > 1 else ""
             p = Path(path) if Path(path).is_absolute() else WORKSPACE / path
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
-            return f"[Written {len(content)} chars to {p}]"
+            result = f"[Written {len(content)} chars to {p}]"
+            rid = _create_receipt(action, str(p), result)
+            return f"[receipt:{rid}] {result}"
 
         elif action in ("Bash", "bash", "run"):
             cmd = _unquote(args_raw)
-            result = subprocess.run(
+            proc = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 cwd=str(WORKSPACE), timeout=60
             )
-            out = (result.stdout + result.stderr).strip()
-            return out[:4000] + ("\n[...truncated...]" if len(out) > 4000 else "") or "[no output]"
+            out = (proc.stdout + proc.stderr).strip()
+            result = out[:4000] + ("\n[...truncated...]" if len(out) > 4000 else "") or "[no output]"
+            rid = _create_receipt(action, cmd, result)
+            return f"[receipt:{rid}] {result}"
 
         elif action in ("Glob", "glob_files"):
             import glob as _glob
             pattern = _unquote(args_raw)
             base = str(WORKSPACE) + "/"
             matches = _glob.glob(base + pattern, recursive=True)
-            return "\n".join(matches[:50]) or "[no matches]"
+            result = "\n".join(matches[:50]) or "[no matches]"
+            rid = _create_receipt(action, pattern, result)
+            return f"[receipt:{rid}] {result}"
 
         elif action in ("Grep", "grep"):
             parts = args_raw.split(",", 1)
             pattern = _unquote(parts[0])
             path = _unquote(parts[1].strip()) if len(parts) > 1 else "."
-            result = subprocess.run(
+            proc = subprocess.run(
                 ["grep", "-rn", "--include=*.py", pattern, path],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", cwd=str(WORKSPACE), timeout=30
             )
-            out = result.stdout.strip()
-            return out[:3000] or "[no matches]"
+            result = proc.stdout.strip()[:3000] or "[no matches]"
+            rid = _create_receipt(action, f"{pattern} in {path}", result)
+            return f"[receipt:{rid}] {result}"
 
         else:
             return f"[Unknown action: {action}]"
@@ -783,7 +845,16 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
     """ReAct loop: call Gemini, parse Action: tags, execute tools,
     feed Observation: back until Final Answer: or max iterations."""
     name = agent["name"]
-    conversation = prompt  # grows with each Thought/Action/Observation turn
+
+    # Priority 3: UNKNOWN state instruction (arXiv:2512.14474 Model-First Reasoning)
+    _unknown_guard = (
+        "\n\nCRITICAL RULES:\n"
+        "- You MUST NOT write 'Observation:' lines. The system provides all observations.\n"
+        "- Before any tool runs, its output is UNKNOWN. Never assign a value to UNKNOWN.\n"
+        "- Output exactly one Action: line, then STOP. Wait for the real Observation.\n"
+        "- Do not invent, guess, or fabricate file contents or execution results.\n"
+    )
+    conversation = prompt + _unknown_guard
 
     for iteration in range(_MAX_REACT_ITERS):
         _dl(f"[ReAct] {name} iter {iteration+1}/{_MAX_REACT_ITERS}")
@@ -796,8 +867,13 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
 
         conversation += f"\n\n{response}"
 
-        # Check for Final Answer
+        # Check for Final Answer — Priority 2: verify receipts before returning
         if "Final Answer" in response or "final answer" in response.lower():
+            warnings = _verify_final_report(response)
+            if warnings:
+                for w in warnings:
+                    _dl(w)
+                response += "\n\n[ORCHESTRATOR WARNING]\n" + "\n".join(warnings)
             return response
 
         # Parse all Action: lines
@@ -815,7 +891,12 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
 
         conversation += obs_block + "\nThought:"
 
-    # Max iters reached — return last response
+    # Max iters reached — verify final response before returning
+    warnings = _verify_final_report(response)
+    if warnings:
+        for w in warnings:
+            _dl(w)
+        response += "\n\n[ORCHESTRATOR WARNING]\n" + "\n".join(warnings)
     return response
 
 

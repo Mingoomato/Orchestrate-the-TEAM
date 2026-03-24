@@ -14,7 +14,7 @@ Orchestration System v5 — Quantum Trading Council (TradingAgents-Enhanced)
   Radi      (Alpha Lead, Opus)  — 팀원 태스크 킥오프 → 결과 검토 → Demis 취합
   Casandra  (Beta Lead, Opus)   — 동상
   Viktor    (CTO, Opus)         — 수학적 알파 검증, OOS 방법론, 체제 이론 & 통계적 엄밀성
-  팀원 8명  (codex exec, GPT)   — 실제 코딩 구현
+  팀원 8명  (Gemini-2.5-pro)    — 실제 코딩 구현
 
 흐름:
   0. 사용자: agenda + 문제 입력
@@ -22,7 +22,7 @@ Orchestration System v5 — Quantum Trading Council (TradingAgents-Enhanced)
   2. Demis: 회의 합성 → 팀장별 태스크 배분
   3. 팀 스프린트:
      a. 팀장 → 팀원에게 태스크 할당 (claude)
-     b. 팀원 → codex exec 구현
+     b. 팀원 → Gemini-2.5-pro ReAct 구현
      c. 팀장 → 결과 검토 (최대 2회 수정 요청)
      d. 팀장 → 전체 결과 취합 → Demis 전달
   4. Demis → 최종 보고서 사용자에게 제공
@@ -384,23 +384,23 @@ MODEL_TIER = {
     "signal_extract":  MODEL_OPUS,
 }
 
-DEMIS    = {"name": "Demis",    "codex": "CEO", "role": "Chief Executive Officer — 전략 합성 & 최종 보고", "model": MODEL_OPUS, "dept": "Executive"}
-RADI     = {"name": "Radi",     "codex": "C1",  "role": "Team Alpha Lead — quant researcher & alpha signal design", "model": MODEL_OPUS, "dept": "Team Alpha"}
-CASANDRA = {"name": "Casandra", "codex": "C2",  "role": "Team Beta Lead — systems architect & project lead",       "model": MODEL_OPUS, "dept": "Team Beta"}
-VIKTOR   = {"name": "Viktor",   "codex": "C0",  "role": "Quant Researcher CTO — mathematical alpha validation, OOS methodology, regime theory & statistical rigor", "model": MODEL_OPUS, "dept": "CTO"}
+DEMIS    = {"name": "Demis",    "tag": "CEO", "role": "Chief Executive Officer — 전략 합성 & 최종 보고", "model": MODEL_OPUS, "dept": "Executive"}
+RADI     = {"name": "Radi",     "tag": "C1",  "role": "Team Alpha Lead — quant researcher & alpha signal design", "model": MODEL_OPUS, "dept": "Team Alpha"}
+CASANDRA = {"name": "Casandra", "tag": "C2",  "role": "Team Beta Lead — systems architect & project lead",       "model": MODEL_OPUS, "dept": "Team Beta"}
+VIKTOR   = {"name": "Viktor",   "tag": "C0",  "role": "Quant Researcher CTO — mathematical alpha validation, OOS methodology, regime theory & statistical rigor", "model": MODEL_OPUS, "dept": "CTO"}
 LEADS    = [RADI, CASANDRA, VIKTOR]
 
 ALPHA_MEMBERS = [
-    {"name": "Darvin",  "codex": "C3",  "model": MODEL_OPUS, "role": "ML engineer — QLSTM architecture & training pipeline",         "dept": "Team Alpha"},
-    {"name": "Felix",   "codex": "C4",  "model": MODEL_OPUS, "role": "data engineer — Bybit API, OHLCV pipeline, 13-dim features",   "dept": "Team Alpha"},
-    {"name": "Jose",    "codex": "C5",  "model": MODEL_OPUS, "role": "risk manager — kill switch, position sizing, leverage control", "dept": "Team Alpha"},
-    {"name": "Felipe",  "codex": "C6",  "model": MODEL_OPUS, "role": "backtest engineer — WR/MDD/Sharpe, OOS validation gates",      "dept": "Team Alpha"},
+    {"name": "Darvin",  "tag": "C3",  "model": MODEL_OPUS, "role": "ML engineer — QLSTM architecture & training pipeline",         "dept": "Team Alpha"},
+    {"name": "Felix",   "tag": "C4",  "model": MODEL_OPUS, "role": "data engineer — Bybit API, OHLCV pipeline, 13-dim features",   "dept": "Team Alpha"},
+    {"name": "Jose",    "tag": "C5",  "model": MODEL_OPUS, "role": "risk manager — kill switch, position sizing, leverage control", "dept": "Team Alpha"},
+    {"name": "Felipe",  "tag": "C6",  "model": MODEL_OPUS, "role": "backtest engineer — WR/MDD/Sharpe, OOS validation gates",      "dept": "Team Alpha"},
 ]
 BETA_MEMBERS = [
-    {"name": "Marvin",   "codex": "C7",  "model": MODEL_OPUS, "role": "quantum computing specialist — VQC circuits, PennyLane",       "dept": "Team Beta"},
-    {"name": "Schwertz", "codex": "C8",  "model": MODEL_OPUS, "role": "trading strategy analyst — signal logic, regime detection",    "dept": "Team Beta"},
-    {"name": "Finman",   "codex": "C9",  "model": MODEL_OPUS, "role": "performance engineer — CUDA optimization, GPU training speed", "dept": "Team Beta"},
-    {"name": "Ilya",     "codex": "C10", "model": MODEL_OPUS, "role": "integration synthesizer — cross-team coordination",            "dept": "Team Beta"},
+    {"name": "Marvin",   "tag": "C7",  "model": MODEL_OPUS, "role": "quantum computing specialist — VQC circuits, PennyLane",       "dept": "Team Beta"},
+    {"name": "Schwertz", "tag": "C8",  "model": MODEL_OPUS, "role": "trading strategy analyst — signal logic, regime detection",    "dept": "Team Beta"},
+    {"name": "Finman",   "tag": "C9",  "model": MODEL_OPUS, "role": "performance engineer — CUDA optimization, GPU training speed", "dept": "Team Beta"},
+    {"name": "Ilya",     "tag": "C10", "model": MODEL_OPUS, "role": "integration synthesizer — cross-team coordination",            "dept": "Team Beta"},
 ]
 ALL_AGENTS = [DEMIS, RADI, CASANDRA, VIKTOR] + ALPHA_MEMBERS + BETA_MEMBERS
 
@@ -429,7 +429,7 @@ def _save(task: str, writer: str, dept: str, content: str) -> Path:
 # ─────────────────────────────────────────────────────────────
 @dataclass
 class AgentState:
-    name: str; codex: str; role: str; dept: str
+    name: str; tag: str; role: str; dept: str
     status: str = "IDLE"
     task: str = ""; preview: str = ""
     start_time: float = 0.0; elapsed: float = 0.0
@@ -457,7 +457,7 @@ class Dashboard:
     def register(self, agents):
         for a in agents:
             self.states[a["name"]] = AgentState(
-                name=a["name"], codex=a["codex"],
+                name=a["name"], tag=a["tag"],
                 role=a["role"], dept=a.get("dept","")
             )
 
@@ -509,7 +509,7 @@ class Dashboard:
                 f"[dim italic]{s.role[:38]}[/]\n{t}\n[italic dim]{p}[/]")
         bd = "green" if s.status == "ACTIVE" else ("yellow" if s.status == "REVIEW" else
              "blue" if s.status == "DONE" else "grey50")
-        return Panel(body, title=f"[bold]{s.name}[/] [dim]{s.codex}[/]",
+        return Panel(body, title=f"[bold]{s.name}[/] [dim]{s.tag}[/]",
                      title_align="left", border_style=bd, height=h)
 
     def _render(self):
@@ -946,12 +946,10 @@ def call_claude(agent: dict, system_prompt: str, user_prompt: str,
     return call_gemini(agent, payload, model, timeout, allow_search=allow_tools)
 
 
-def call_codex(member: dict, prompt: str, timeout: int = 300) -> str:
-    """
-    (Replaced) Calls the Gemini API for code generation/implementation tasks.
-    """
+def call_gemini_impl(member: dict, prompt: str, timeout: int = 300) -> str:
+    """Gemini-2.5-pro 코드 생성/구현 태스크 호출."""
     agent_dict = {
-        "name": member.get("name", "Codex"),
+        "name": member.get("name", "Gemini"),
         "model": MODEL_OPUS,
     }
     return call_gemini(agent_dict, prompt, MODEL_OPUS, timeout)
@@ -1657,7 +1655,7 @@ def _parse_tasks(text: str, lead: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 3/4: 팀 스프린트 (codex 구현 + claude 검토)
+# Phase 3/4: 팀 스프린트 (Gemini-2.5-pro ReAct 구현)
 # ─────────────────────────────────────────────────────────────
 MAX_REVISIONS = 2  # 팀장의 최대 수정 요청 횟수
 
@@ -1764,7 +1762,7 @@ def _member_implement(member: dict, task: str, plan: str, kickoff: str,
     agent = {
         "name": member["name"],
         "model": member.get("model", MODEL_OPUS),
-        "codex": member["codex"],
+        "tag": member["tag"],
         "role": member["role"],
         "dept": member["dept"],
     }
@@ -1816,7 +1814,7 @@ def extract_sprint_decision(member_name: str, task: str, result: str) -> dict:
     Returns dict with: action, confidence, files_changed, gate_impact, blockers, papers_cited
     """
     extract_agent = {"name": member_name, "model": MODEL_TIER["signal_extract"],
-                     "codex": "EX", "role": "extractor", "dept": "System"}
+                     "tag": "EX", "role": "extractor", "dept": "System"}
     prompt = (
         "Extract a structured decision from this sprint result. "
         "Return ONLY a valid JSON object with exactly these keys:\n"
@@ -1992,7 +1990,7 @@ def run_team_sprint(lead: dict, members: list[dict],
     if _CP:
         sprint_key = lead["name"].lower()[:5]
         _CP.data["summaries"][sprint_key if sprint_key in _CP.data["summaries"]
-                              else lead["codex"].lower()] = summary
+                              else lead["tag"].lower()] = summary
         phase_key = {"Radi": "alpha_sprint", "Casandra": "beta_sprint"}.get(lead["name"], "alpha_sprint")
         _CP.mark(phase_key)
     return summary

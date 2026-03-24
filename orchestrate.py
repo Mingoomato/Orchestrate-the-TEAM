@@ -790,6 +790,10 @@ def call_gemini(agent: dict, prompt: str, model_name: str, timeout: int,
 _REACT_ACTION_RE = re.compile(
     r"Action:\s*(\w+)\s*\(\s*(.*?)\s*\)\s*$", re.MULTILINE | re.DOTALL
 )
+# Shell-style fallback: "Action: ls -R reports/" or "Action: python scripts/foo.py"
+_REACT_SHELL_RE = re.compile(
+    r"Action:\s*([a-zA-Z][^\n(]{0,120})$", re.MULTILINE
+)
 _MAX_REACT_ITERS = 6
 
 
@@ -906,8 +910,15 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
                 response += "\n\n[ORCHESTRATOR WARNING]\n" + "\n".join(warnings)
             return response
 
-        # Parse all Action: lines
+        # Parse Action: lines — function style first, shell fallback second
         actions = _REACT_ACTION_RE.findall(response)
+        if not actions:
+            # Try shell-style: "Action: ls -R reports/" → Bash(cmd)
+            shell_matches = _REACT_SHELL_RE.findall(response)
+            # Filter out lines that are already matched by function regex
+            shell_matches = [m.strip() for m in shell_matches
+                             if "(" not in m and m.strip()]
+            actions = [("Bash", cmd) for cmd in shell_matches]
         if not actions:
             # No more actions — model is done
             return response
@@ -917,7 +928,7 @@ def call_gemini_react(agent: dict, prompt: str, model_name: str,
         for act_name, act_args in actions:
             obs = _exec_react_action(act_name, act_args)
             obs_block += f"\nObservation: {obs}\n"
-            _dl(f"[ReAct] {name} — {act_name}(...) → {obs[:80]}...")
+            _dl(f"[ReAct] {name} — {act_name}({act_args[:40]}) → {obs[:80]}...")
 
         conversation += obs_block + "\nThought:"
 
@@ -1379,16 +1390,25 @@ def run_adversarial_debate(agenda: str, problem: str) -> dict:
     _dl("Pre-Council Results Scan: Radi(backtest) + Viktor(gate audit) — data-driven")
 
     # Radi — 지난 백테스트 결과 읽기
+    _tool_fmt = (
+        "TOOL FORMAT — use exactly this syntax for file access:\n"
+        "  Action: Read('reports/filename.csv')      — read a file\n"
+        "  Action: Glob('reports/*.csv')             — list files by pattern\n"
+        "  Action: Bash('ls reports/ project_output/')  — run shell command\n"
+        "Output ONE Action line, then stop. The system will provide the Observation.\n"
+    )
     radi_sys = (
         f"{_PERSONAS['Radi']}\n\n{_PROJ_CTX}\n\n"
         "ROLE: You are scanning the latest backtest results to brief the council. "
         "Read available CSV/report files, extract WR, EV/trade, MDD, Sharpe. "
-        "State facts only — no opinion. English, 5 bullet points max."
+        "State facts only — no opinion. English, 5 bullet points max.\n\n"
+        f"{_tool_fmt}"
     )
     radi_user = (
         f"Agenda: {agenda[:300]}\n\n"
         "Scan the most recent backtest output files (reports/, project_output/) "
         "and summarize the key performance numbers: WR, EV, MDD, trade count, Gate 1/2 status. "
+        "Start with: Action: Glob('reports/*.csv')\n"
         "If no backtest files exist, state that clearly."
     )
     _du("Radi", status="SCANNING", task="Pre-council backtest scan")
@@ -1403,13 +1423,15 @@ def run_adversarial_debate(agenda: str, problem: str) -> dict:
         f"{_PERSONAS['Viktor']}\n\n{_PROJ_CTX}\n\n"
         "ROLE: You are auditing the mathematical state of the system before council. "
         "Check validation gate files, checkpoint status, and feature pipeline integrity. "
-        "Report facts with numbers. English, 5 bullet points max."
+        "Report facts with numbers. English, 5 bullet points max.\n\n"
+        f"{_tool_fmt}"
     )
     viktor_user = (
         f"Agenda: {agenda[:300]}\n\n"
         "Check: (1) backtesting/validation.py Gate 1/2 thresholds, "
         "(2) latest checkpoint file in checkpoints/, "
         "(3) any existing validation results or r-multiple CSVs. "
+        "Start with: Action: Glob('backtesting/*.py')\n"
         "Report what exists and what is missing."
     )
     _du("Viktor", status="AUDITING", task="Pre-council gate audit")
